@@ -1,0 +1,2181 @@
+"""
+frankSpikes - Siril GUI script (Python)
+Author: Frank Sferlazza
+
+Light/tone and color/hue adjustment tool for a single image, in the same
+dark-themed style and with the same real full-resolution zoom/pan preview
+as BB/NB Mixer.
+
+Controls:
+Light & Tones
+   - Exposure: brightens/darkens the whole image
+   - Contrast: separates the subject from the background
+   - Blacks / Sky Background: sets how deep the sky/background is
+   - Highlights / Whites: protects the brightest areas from burning, or
+     pushes them brighter
+   - Clarity: local (mid-tone) contrast on a large-radius unsharp mask,
+     brings out nebula structure without touching global contrast
+Color & Hue
+   - Vibrance: boosts weaker colors more than already-saturated ones
+     (protects reds like Ha from clipping), unlike a flat Saturation boost
+   - Saturation: makes all colors more or less vivid, uniformly
+   - Temperature: blue/yellow color balance
+   - Tint: green/magenta color balance (handy for removing the greenish
+     light-pollution cast)
+Diffraction Spikes (panel to the right of the preview)
+   - Realistic star spikes as produced by a reflector's secondary-mirror
+     spider: 4 rays for a 2-vane (or refractor) spider, 6 rays for a 3-vane
+     spider (e.g. most Newtonians). Only stars at or above the chosen
+     minimum diameter get spikes; length is proportional to each star's own
+     size, brightness follows the star's own amplitude (with a floor so
+     ordinary stars aren't crushed to invisibility next to the single
+     brightest one in the field), and rays stay strong for most of their
+     length before tapering near the tip.
+   - Each spike takes on its own star's real colour (sampled from the
+     star's own core pixels) rather than a flat white glow.
+   - Sharpness: softens the whole effect - useful at long focal lengths,
+     where seeing/optics blur real diffraction spikes well beyond a
+     pixel-crisp render (100 = untouched, lower = softer).
+   - Soft flare: a large, soft round glow around each qualifying star.
+   - Ring flare: a thin bright diffraction ring around each star.
+   - Color hue: rotates every star's spike colour by the same amount.
+   - Color fringing: a blue-near-star/warm-near-tip chromatic separation on
+     top of the star's colour, like real wavelength-dependent diffraction.
+   - Rainbow intensity: an artistic multi-hue cycle along each ray, also
+     layered on top of the star's own colour.
+   - Color saturation: master control for how colourful the whole effect
+     is - 0 keeps every spike/flare pure white regardless of the star's own
+     colour or the other sliders.
+   - After generating, Ctrl+Click a star in the preview to remove/restore
+     its spikes (this also lets you force a spike onto a star smaller than
+     the minimum diameter), or Ctrl+Click empty space to add one manually.
+
+Hold Space over the preview to see the original, untouched image at the
+same pan/zoom position - release to go back to the edited view.
+
+HOW TO USE IT
+1. In Siril, open the image you want to edit.
+2. Menu Scripts -> Python Scripts -> run this file. It reads the image
+   that is already open in Siril automatically - there is nothing to
+   browse for or load by hand.
+3. Move the sliders while watching the preview.
+4. Click "Process and import in Siril": the result is applied directly to
+   the active image in Siril - the script stays open, so if you don't like
+   it, keep adjusting the sliders and Process again as many times as you
+   want (each time starts fresh from the untouched original, never
+   stacking on the previous result). Saving or undoing any of those
+   results is done in Siril itself (File > Save, Ctrl+Z), exactly like any
+   other Siril step - each Process pushes its own undo checkpoint there.
+   Close the window whenever you're happy with the result.
+"""
+
+import os
+import sys
+import threading
+import queue
+import traceback
+import webbrowser
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import numpy as np
+from PIL import Image, ImageFilter, ImageTk
+
+import sirilpy as s
+from sirilpy import SirilConnectionError
+
+APP_VERSION = "1.0"
+PREVIEW_MAX_W = 1600
+NAV_MAX_W = 210
+NAV_MAX_H = 160
+FACEBOOK_URL = "https://www.facebook.com/francesco.sferlazza"
+
+# Single source of truth for the spike panel's defaults, used both to set
+# up the sliders and by the "Defaults" button - one place to tune them.
+SPIKE_DEFAULTS = {
+    "enabled": True,
+    "min_diam": 20.0,
+    "length": 4.0,
+    "rays": 4,
+    "rotation": 30.0,
+    "intensity": 110.0,
+    "thickness": 1.1,
+    "sharpness": 100.0,
+    "soft_flare": 11.0,
+    "ring_flare": 7.0,
+    "hue": 0.0,
+    "chroma": 21.0,
+    "rainbow": 21.0,
+    "saturation": 0.0,
+}
+
+PALETTE = {
+    "bg": "#0e1117",
+    "panel": "#161a23",
+    "border": "#262c3a",
+    "input_bg": "#1c212c",
+    "trough": "#0a0c11",
+    "text": "#e7e9ee",
+    "muted": "#8891a5",
+    "accent": "#4f7cff",
+    "accent_hover": "#6f95ff",
+    "accent_disabled": "#33405e",
+    "green": "#3ddc84",
+    "red": "#ef5555",
+    "red_hover": "#f47a7a",
+    "amber": "#e0a53d",
+    "amber_hover": "#eab662",
+}
+
+FONT_BASE = ("Segoe UI", 9)
+FONT_HEADER = ("Segoe UI", 15, "bold")
+FONT_SUBHEADER = ("Segoe UI", 9)
+FONT_CARD_TITLE = ("Segoe UI", 10, "bold")
+FONT_BADGE = ("Segoe UI", 8, "bold")
+
+
+def setup_style(root):
+    """Dark theme with blue accents, matching BB/NB Mixer: cards with bold
+    headers, solid buttons for the main actions, a 'pill' toolbar for zoom.
+    'clam' is the only ttk theme that actually honors custom colors on
+    Windows (the native theme ignores most of them)."""
+    P = PALETTE
+    root.configure(bg=P["bg"])
+
+    style = ttk.Style(root)
+    style.theme_use("clam")
+
+    style.configure(".", background=P["bg"], foreground=P["text"], font=FONT_BASE,
+                     fieldbackground=P["input_bg"], bordercolor=P["border"],
+                     lightcolor=P["border"], darkcolor=P["border"])
+
+    style.configure("TFrame", background=P["bg"])
+    style.configure("Card.TFrame", background=P["panel"])
+    style.configure("Toolbar.TFrame", background=P["panel"])
+
+    style.configure("TLabel", background=P["bg"], foreground=P["text"])
+    style.configure("Muted.TLabel", background=P["bg"], foreground=P["muted"])
+    style.configure("Card.TLabel", background=P["panel"], foreground=P["text"])
+    style.configure("CardMuted.TLabel", background=P["panel"], foreground=P["muted"])
+    style.configure("Header.TLabel", background=P["bg"], foreground=P["text"], font=FONT_HEADER)
+    style.configure("SubHeader.TLabel", background=P["bg"], foreground=P["muted"], font=FONT_SUBHEADER)
+    style.configure("Badge.TLabel", background=P["accent"], foreground="white",
+                     font=FONT_BADGE, padding=(8, 3))
+    style.configure("ZoomPct.TLabel", background=P["panel"], foreground=P["accent"],
+                     font=FONT_CARD_TITLE)
+    style.configure("Status.TLabel", background=P["panel"], foreground=P["green"], font=FONT_BASE)
+
+    style.configure("TLabelframe", background=P["panel"], bordercolor=P["border"],
+                     relief="solid", borderwidth=1)
+    style.configure("TLabelframe.Label", background=P["panel"], foreground=P["accent"],
+                     font=FONT_CARD_TITLE)
+
+    style.configure("TEntry", fieldbackground=P["input_bg"], foreground=P["text"],
+                     bordercolor=P["border"], insertcolor=P["text"], padding=4)
+    style.map("TEntry", fieldbackground=[("readonly", P["panel"])],
+              foreground=[("readonly", P["muted"])])
+
+    # Unstyled, these fall back to the 'clam' theme's own light/white
+    # background - readable on a light window but not on this dark one,
+    # and even less so once hovered/active.
+    style.configure("TCheckbutton", background=P["panel"], foreground=P["text"],
+                     indicatorbackground=P["input_bg"], indicatorforeground=P["accent"])
+    style.map("TCheckbutton",
+              background=[("active", P["panel"])],
+              foreground=[("disabled", P["muted"])],
+              indicatorbackground=[("selected", P["accent"]), ("active", P["input_bg"])])
+
+    style.configure("TRadiobutton", background=P["panel"], foreground=P["text"],
+                     indicatorbackground=P["input_bg"], indicatorforeground=P["accent"])
+    style.map("TRadiobutton",
+              background=[("active", P["panel"])],
+              foreground=[("disabled", P["muted"])],
+              indicatorbackground=[("selected", P["accent"]), ("active", P["input_bg"])])
+
+    style.configure("TButton", background=P["input_bg"], foreground=P["text"],
+                     bordercolor=P["border"], padding=6, relief="flat")
+    style.map("TButton", background=[("active", P["border"]), ("disabled", P["panel"])],
+              foreground=[("disabled", P["muted"])])
+
+    style.configure("Accent.TButton", background=P["accent"], foreground="white",
+                     padding=9, font=("Segoe UI", 9, "bold"), relief="flat")
+    style.map("Accent.TButton",
+              background=[("active", P["accent_hover"]), ("disabled", P["accent_disabled"])],
+              foreground=[("disabled", P["muted"])])
+
+    style.configure("Toolbar.TButton", background=P["panel"], foreground=P["text"],
+                     bordercolor=P["border"], padding=(10, 5), relief="flat")
+    style.map("Toolbar.TButton", background=[("active", P["accent"])])
+
+    style.configure("Warn.TButton", background=P["amber"], foreground="#1a1200",
+                     padding=6, relief="flat")
+    style.map("Warn.TButton", background=[("active", P["amber_hover"])])
+
+    style.configure("Danger.TButton", background=P["red"], foreground="white",
+                     padding=6, relief="flat")
+    style.map("Danger.TButton", background=[("active", P["red_hover"])])
+
+    style.configure("Spin.TButton", background=P["input_bg"], foreground=P["text"],
+                     bordercolor=P["border"], padding=0, relief="flat",
+                     font=("Segoe UI", 6))
+    style.map("Spin.TButton", background=[("active", P["border"])])
+
+    style.configure("Horizontal.TScale", background=P["panel"], troughcolor=P["trough"],
+                     bordercolor=P["panel"], lightcolor=P["accent"], darkcolor=P["accent"])
+
+    style.configure("TProgressbar", background=P["accent"], troughcolor=P["trough"],
+                     bordercolor=P["panel"], lightcolor=P["accent"], darkcolor=P["accent"])
+
+    return style
+
+
+def to_hwc(arr):
+    """Convert Siril's (C,H,W) pixel data (or plain (H,W) mono) to (H,W,3) RGB."""
+    if arr.ndim == 2:
+        return np.stack([arr, arr, arr], axis=-1)
+    if arr.ndim == 3:
+        if arr.shape[0] == 1:
+            a = arr[0]
+            return np.stack([a, a, a], axis=-1)
+        if arr.shape[0] == 3:
+            return np.transpose(arr, (1, 2, 0))
+    return arr
+
+
+def to_float01(arr):
+    if arr.dtype == np.uint16:
+        return arr.astype(np.float32) / 65535.0
+    if arr.dtype == np.uint8:
+        return arr.astype(np.float32) / 255.0
+    return arr.astype(np.float32)
+
+
+def downsample(arr, max_w=PREVIEW_MAX_W):
+    h, w = arr.shape[:2]
+    if w <= max_w:
+        return arr
+    scale = max_w / w
+    new_w, new_h = max_w, max(1, int(h * scale))
+    im = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+    im = im.resize((new_w, new_h), Image.LANCZOS)
+    return np.asarray(im).astype(np.float32) / 255.0
+
+
+def resize_layer(layer, out_w, out_h):
+    """Area-averaging resize of an additive (H,W,3) glow layer to an exact
+    target size (used to properly downsample a supersampled spike render,
+    rather than point-sampling a thin line on a sparse grid)."""
+    img = Image.fromarray((np.clip(layer, 0, 1) * 255).astype(np.uint8))
+    img = img.resize((out_w, out_h), Image.BILINEAR)
+    return np.asarray(img).astype(np.float32) / 255.0
+
+
+def _blur_layer_rgb(layer, radius):
+    """Gaussian-blur an additive (H,W,3) glow layer - used for the spike
+    Sharpness slider (long-focal-length setups and average seeing soften
+    real diffraction spikes well beyond a crisp pixel-for-pixel render)."""
+    if radius <= 0:
+        return layer
+    img = Image.fromarray((np.clip(layer, 0, 1) * 255).astype(np.uint8), mode="RGB")
+    blurred = img.filter(ImageFilter.GaussianBlur(radius=radius))
+    return np.asarray(blurred).astype(np.float32) / 255.0
+
+
+def format_error(e):
+    """Error message with debug-useful details (errno/winerror on Windows)
+    instead of plain str(e), which for OSError can hide key information."""
+    head = str(e)
+    if isinstance(e, OSError):
+        head = f"errno={e.errno} winerror={getattr(e, 'winerror', None)} {head}"
+    return head + "\n\n" + traceback.format_exc()
+
+
+def _gaussian_blur(gray, radius):
+    """Gaussian blur of a single-channel float [0,1] array via PIL (no scipy
+    dependency needed)."""
+    img = Image.fromarray((np.clip(gray, 0, 1) * 255).astype(np.uint8))
+    blurred = img.filter(ImageFilter.GaussianBlur(radius=radius))
+    return np.asarray(blurred).astype(np.float32) / 255.0
+
+
+def apply_cosmetics(rgb, exposure, temperature, tint, contrast, blacks, highlights,
+                     clarity, vibrance, saturation):
+    """Full light/tone/color pass on an (H,W,3) float [0,1] image. All 9
+    parameters are on a -100..100 scale, 0 = no change. Order: exposure,
+    then white balance (temperature/tint), then contrast, then black/white
+    point, then clarity (local contrast), then vibrance and saturation last
+    (act on the final color balance)."""
+    out = rgb.astype(np.float32).copy()
+
+    stops = exposure / 100.0 * 2.0
+    out = out * (2.0 ** stops)
+
+    temp_shift = temperature / 100.0 * 0.15
+    tint_shift = tint / 100.0 * 0.15
+    out[..., 0] = out[..., 0] + temp_shift + tint_shift * 0.5   # R: warm + magenta
+    out[..., 1] = out[..., 1] - tint_shift                       # G: green <-> magenta axis
+    out[..., 2] = out[..., 2] - temp_shift + tint_shift * 0.5    # B: cool + magenta
+    out = np.clip(out, 0.0, 1.0)
+
+    c_factor = 1.0 + contrast / 100.0
+    out = (out - 0.5) * c_factor + 0.5
+
+    bp = float(np.clip(blacks / 100.0 * 0.3, -0.9, 0.9))
+    out = (out - bp) / max(1e-6, 1.0 - bp)
+
+    wp = 1.0 - float(np.clip(highlights / 100.0 * 0.3, -0.9, 0.9))
+    out = out / max(1e-6, wp)
+
+    out = np.clip(out, 0.0, 1.0)
+
+    if clarity != 0:
+        # Local (mid-tone) contrast: unsharp-mask the luminance with a large
+        # radius (~1% of the shorter side) and add the extracted detail back
+        # into every channel equally, so structure pops without a color
+        # shift the way a per-channel unsharp mask would cause.
+        h, w = out.shape[:2]
+        radius = max(2, int(round(min(h, w) * 0.01)))
+        luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        detail = luma - _gaussian_blur(luma, radius)
+        out = out + (detail * (clarity / 100.0) * 1.5)[..., None]
+        out = np.clip(out, 0.0, 1.0)
+
+    if vibrance != 0:
+        # Unlike Saturation (flat boost everywhere), Vibrance pushes weakly
+        # saturated pixels harder and already-vivid ones (e.g. a strong Ha
+        # red) less, so it doesn't clip colors that are already intense.
+        maxc = np.max(out, axis=-1)
+        minc = np.min(out, axis=-1)
+        cur_sat = maxc - minc
+        v_factor = 1.0 + (vibrance / 100.0) * (1.0 - cur_sat)
+        luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        out = luma[..., None] + (out - luma[..., None]) * v_factor[..., None]
+        out = np.clip(out, 0.0, 1.0)
+
+    luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+    s_factor = 1.0 + saturation / 100.0
+    out = luma[..., None] + (out - luma[..., None]) * s_factor
+
+    return np.clip(out, 0.0, 1.0)
+
+
+def _star_attr(st, *names, default=0.0):
+    """Read the first attribute name that exists on a PSFStar object. Siril's
+    Python API has used slightly different naming across versions (e.g.
+    fwhm_x vs fwhmx); this keeps star detection working even if the exact
+    field name drifts."""
+    for n in names:
+        if hasattr(st, n):
+            try:
+                return float(getattr(st, n))
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+def refine_star_position(full_rgb, x, y, fwhm, max_shift_frac=0.3):
+    """findstar's PSF-fit centroid can be pulled slightly off a star's true
+    visual peak by nearby nebulosity or a neighbouring star, especially in
+    crowded or nebulous fields - this snaps to a brightness-weighted
+    centroid of the brightest pixels in a small window around the reported
+    position, so spikes and flares centre on what the eye actually sees as
+    the star. Robust to single-pixel noise (a weighted average of the top
+    10% brightest pixels, not just the single brightest one).
+
+    The proposed correction is capped at max_shift_frac * fwhm (floor 2px):
+    findstar's own PSF fit is a more reliable estimate than this simple
+    weighted centroid, so a LARGE proposed shift more likely means the
+    search window caught a neighbour or a nebula wisp instead of the star
+    itself - in that case the original position is kept rather than
+    trusting a correction that's actually making things worse."""
+    h, w = full_rgb.shape[:2]
+    r = max(2, int(round(fwhm * 0.7)))
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+    y0, y1 = max(0, yi - r), min(h, yi + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        return x, y
+    patch = full_rgb[y0:y1, x0:x1]
+    luma = 0.299 * patch[..., 0] + 0.587 * patch[..., 1] + 0.114 * patch[..., 2]
+    thresh = float(np.percentile(luma, 90)) if luma.size > 4 else float(luma.max())
+    mask = luma >= thresh
+    if not mask.any():
+        return x, y
+    yy, xx = np.mgrid[0:luma.shape[0], 0:luma.shape[1]]
+    weights = luma[mask]
+    cy = float(np.average(yy[mask], weights=weights))
+    cx = float(np.average(xx[mask], weights=weights))
+    rx, ry = x0 + cx, y0 + cy
+
+    shift = ((rx - x) ** 2 + (ry - y) ** 2) ** 0.5
+    if shift > max(2.0, fwhm * max_shift_frac):
+        return x, y
+    return rx, ry
+
+
+def sample_star_color(full_rgb, x, y, fwhm):
+    """The star's own colour, normalized so its brightest channel is 1.0 (a
+    pure hue/colour direction - actual brightness is handled separately by
+    the intensity/amplitude system).
+
+    Any star bright enough to earn a prominent spike is usually clipped to
+    white at its very core (sensor/stretch saturation) - sampling the
+    brightest pixels of the patch, as a naive approach would, mostly grabs
+    that clipped white and washes every star to the same near-colourless
+    tint regardless of whether it looks blue or orange in the image. So
+    unclipped pixels (no channel pinned near 1.0) are preferred, and the
+    brightest among THOSE are used - still clearly starlight, not sky
+    background, but from the PSF's wings where the true colour survives."""
+    h, w = full_rgb.shape[:2]
+    r = max(3, int(round(fwhm * 1.5)))
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+    y0, y1 = max(0, yi - r), min(h, yi + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        return (1.0, 1.0, 1.0)
+    patch = full_rgb[y0:y1, x0:x1].reshape(-1, 3)
+    luma = 0.299 * patch[:, 0] + 0.587 * patch[:, 1] + 0.114 * patch[:, 2]
+    channel_max = patch.max(axis=1)
+    not_clipped = channel_max < 0.98
+    if not_clipped.any():
+        candidates, cand_luma = patch[not_clipped], luma[not_clipped]
+    else:
+        candidates, cand_luma = patch, luma  # genuinely a fully white/overexposed star
+    thresh = float(np.percentile(cand_luma, 70)) if cand_luma.size > 4 else float(cand_luma.max())
+    mask = cand_luma >= thresh
+    if not mask.any():
+        mask = cand_luma >= cand_luma.max() * 0.9
+    col = candidates[mask].mean(axis=0)
+    m = max(float(col.max()), 1e-4)
+    return (float(col[0] / m), float(col[1] / m), float(col[2] / m))
+
+
+def _rotate_hue(rgb, degrees):
+    """Rotate the hue of a normalized (r,g,b) colour by `degrees`, keeping
+    its saturation/value. Used to let the user dial the star-colour spikes
+    toward a different tint (StarSpikes Pro's "Color Hue")."""
+    if not degrees:
+        return rgb
+    r, g, b = rgb
+    mx, mn = max(r, g, b), min(r, g, b)
+    v = mx
+    d = mx - mn
+    s = 0.0 if mx <= 1e-6 else d / mx
+    if d <= 1e-6:
+        h = 0.0
+    elif mx == r:
+        h = (60 * ((g - b) / d) + 360) % 360
+    elif mx == g:
+        h = (60 * ((b - r) / d) + 120) % 360
+    else:
+        h = (60 * ((r - g) / d) + 240) % 360
+    h = (h + degrees) % 360
+    c = v * s
+    x = c * (1 - abs((h / 60.0) % 2 - 1))
+    m = v - c
+    if h < 60: rp, gp, bp = c, x, 0.0
+    elif h < 120: rp, gp, bp = x, c, 0.0
+    elif h < 180: rp, gp, bp = 0.0, c, x
+    elif h < 240: rp, gp, bp = 0.0, x, c
+    elif h < 300: rp, gp, bp = x, 0.0, c
+    else: rp, gp, bp = c, 0.0, x
+    return (rp + m, gp + m, bp + m)
+
+
+def _spike_color_mult(t, star_color, chroma, rainbow, saturation):
+    """Per-pixel (R,G,B) colour multipliers for a point at fractional
+    distance t (0=star, 1=tip) along a ray. The base colour is the star's
+    own (already hue-rotated) colour; two more effects layer on top of it,
+    then the whole thing is faded toward neutral white by `saturation`
+    (0 = pure white spike regardless of the star's colour or the other two
+    sliders, 100 = full colour):
+    - chroma: a physically-styled two-tone gradient, blue-ish near the
+      star, warm near the tip (real diffraction spreads longer wavelengths
+      further).
+    - rainbow: an artistic multi-hue cycle along the ray's length, for the
+      flashier prism-like look some presets go for.
+    """
+    r_col, g_col, b_col = star_color
+    warm = min(1.0, chroma / 100.0) * 1.8
+    r_mult = 1.0 + warm * t
+    g_mult = 1.0
+    b_mult = 1.0 + warm * (1.0 - t) * 0.6
+
+    if rainbow > 0:
+        amt = min(1.0, rainbow / 100.0)
+        freq = 1.6  # fixed number of colour cycles along the ray
+        rb_r = 0.5 + 0.5 * np.cos(2 * np.pi * (t * freq + 0.00))
+        rb_g = 0.5 + 0.5 * np.cos(2 * np.pi * (t * freq + 0.33))
+        rb_b = 0.5 + 0.5 * np.cos(2 * np.pi * (t * freq + 0.66))
+        r_mult = r_mult * (1 - amt) + (0.4 + 1.6 * rb_r) * amt
+        g_mult = g_mult * (1 - amt) + (0.4 + 1.6 * rb_g) * amt
+        b_mult = b_mult * (1 - amt) + (0.4 + 1.6 * rb_b) * amt
+
+    r_full = r_col * r_mult
+    g_full = g_col * g_mult
+    b_full = b_col * b_mult
+
+    sat = min(1.0, max(0.0, saturation / 100.0))
+    r_final = 1.0 + (r_full - 1.0) * sat
+    g_final = 1.0 + (g_full - 1.0) * sat
+    b_final = 1.0 + (b_full - 1.0) * sat
+    return r_final, g_final, b_final
+
+
+def _soft_knee(x, knee=0.75):
+    """Identity below `knee`, then a smooth exponential approach to 1.0
+    above it - used instead of a hard clip at 1.0.
+
+    A hard clip flattens the top of a Gaussian cross-section into a wide,
+    flat-topped band wherever peak*perp_falloff exceeds 1 (exactly what
+    happens across a growing width of the ray as the Intensity slider is
+    pushed up), which reads as a blocky, segment-like bar instead of a
+    naturally tapered, pointed spike. This keeps values already below the
+    knee untouched (so normal/default Intensity looks exactly as before)
+    and only softens the part that would otherwise have been clipped."""
+    x = np.asarray(x, dtype=np.float32)
+    span = 1.0 - knee
+    over = x - knee
+    return np.where(x > knee, knee + span * (1.0 - np.exp(-over / span)), x)
+
+
+def _add_spike_ray(layer, cx, cy, angle_deg, length_px, thickness_px, peak,
+                    star_color, chroma, rainbow, saturation):
+    """Add one tapered, glowing half-ray from (cx, cy) outward at angle_deg
+    into an (H,W,3) additive layer. The ray stays close to full brightness
+    for most of its length and only tapers hard near the very tip (matching
+    how dramatic diffraction-spike presets look, rather than a physically
+    exact 1/r falloff that would read as barely visible)."""
+    if length_px < 1.0 or peak <= 0:
+        return
+    h, w, _ = layer.shape
+    pad = thickness_px + 1.0
+    x0 = int(max(0, np.floor(cx - length_px - pad)))
+    x1 = int(min(w, np.ceil(cx + length_px + pad)))
+    y0 = int(max(0, np.floor(cy - length_px - pad)))
+    y1 = int(min(h, np.ceil(cy + length_px + pad)))
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    dx = xx - cx
+    dy = yy - cy
+    theta = np.radians(angle_deg)
+    dir_x, dir_y = np.cos(theta), np.sin(theta)
+    along = dx * dir_x + dy * dir_y
+    perp = np.abs(-dx * dir_y + dy * dir_x)
+
+    t = np.clip(along / max(length_px, 1e-6), 0.0, 1.0)
+    # Rays taper slightly (thinner toward the tip than at the star's core).
+    # The 0.3 floor used to be large enough to visibly override a genuinely
+    # thin thickness_px at low preview scale - the same class of preview/
+    # Process mismatch as the outer floor already removed from
+    # render_spike_layer. Kept tiny here only to avoid a division by ~0.
+    local_thickness = thickness_px * (1.0 - 0.35 * t)
+    perp_falloff = np.exp(-(perp ** 2) / (2.0 * np.maximum(local_thickness, 0.02) ** 2))
+    # Along the ray: a soft bulge right at the star, a long near-full-
+    # brightness run, then a fade only in the last stretch toward the tip.
+    along_falloff = np.where(
+        along < 0,
+        np.exp(-(along ** 2) / (2.0 * (thickness_px * 1.5) ** 2)),
+        (1.0 - t) ** 0.55,
+    )
+    mask = along <= length_px
+    base = _soft_knee(peak * perp_falloff * along_falloff * mask)
+
+    r_mult, g_mult, b_mult = _spike_color_mult(t, star_color, chroma, rainbow, saturation)
+    layer[y0:y1, x0:x1, 0] = np.maximum(layer[y0:y1, x0:x1, 0], base * r_mult)
+    layer[y0:y1, x0:x1, 1] = np.maximum(layer[y0:y1, x0:x1, 1], base * g_mult)
+    layer[y0:y1, x0:x1, 2] = np.maximum(layer[y0:y1, x0:x1, 2], base * b_mult)
+
+
+def _add_soft_flare(layer, cx, cy, radius_px, peak):
+    """A large, very soft circular glow around the star in every direction
+    (not just along the rays) - mimics sensor/optics bloom around bright
+    stars."""
+    if radius_px < 1.0 or peak <= 0:
+        return
+    h, w, _ = layer.shape
+    sigma = radius_px * 0.5
+    # The old box only extended to radius_px+1 (~2 sigma), where the
+    # Gaussian is still at ~14% of its peak - the hard edge of that square
+    # bounding box then showed up as a visible square around the glow,
+    # worse the bigger the star. 3 sigma decays to ~1%, small enough that
+    # clipping it there reads as a clean circular falloff instead.
+    pad = sigma * 3.0 + 1.0
+    x0 = int(max(0, np.floor(cx - pad)))
+    x1 = int(min(w, np.ceil(cx + pad)))
+    y0 = int(max(0, np.floor(cy - pad)))
+    y1 = int(min(h, np.ceil(cy + pad)))
+    if x1 <= x0 or y1 <= y0:
+        return
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    falloff = np.exp(-(r ** 2) / (2.0 * sigma ** 2))
+    contrib = peak * falloff
+    layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
+
+
+def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak):
+    """A thin bright ring around the star at a fixed radius, like the first
+    diffraction ring caused by the secondary-mirror obstruction."""
+    if ring_radius_px < 1.0 or peak <= 0:
+        return
+    h, w, _ = layer.shape
+    ring_width_px = max(ring_width_px, 0.5)
+    # Same reasoning as _add_soft_flare's padding: the ring's own falloff
+    # has a sigma of ring_width_px, so the old +1px pad left the Gaussian
+    # only barely decayed at the box edge - visible as a faint square
+    # halo around the ring on a big/bright-enough star.
+    pad = ring_width_px * 3.0 + 1.0
+    x0 = int(max(0, np.floor(cx - ring_radius_px - pad)))
+    x1 = int(min(w, np.ceil(cx + ring_radius_px + pad)))
+    y0 = int(max(0, np.floor(cy - ring_radius_px - pad)))
+    y1 = int(min(h, np.ceil(cy + ring_radius_px + pad)))
+    if x1 <= x0 or y1 <= y0:
+        return
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    d = r - ring_radius_px
+    falloff = np.exp(-(d ** 2) / (2.0 * ring_width_px ** 2))
+    contrib = peak * falloff
+    layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
+
+
+def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars,
+                        min_diameter, length_mult, num_rays, rotation_deg,
+                        intensity, thickness, hue, chroma, rainbow, saturation,
+                        soft_flare, ring_flare, sharpness=100.0):
+    """Render an additive (H,W,3) glow layer - spikes, soft flare and ring
+    flare combined - for a [view_x0, view_y0, view_w, view_h] window of the
+    full-resolution image, scaled to out_shape=(out_h, out_w). Used
+    identically for the fit raster, a hi-res crop, and the final full-
+    resolution render, so the effect has the same real-world size
+    regardless of zoom. stars: list of (xpos, ypos, fwhm, amplitude, color,
+    forced) in full-resolution pixels - color is the star's own normalized
+    (r,g,b); forced=True bypasses the min_diameter cutoff (used for stars
+    the user explicitly turned on with Ctrl+Click even though they're
+    smaller than the current threshold). sharpness (0-100, default 100 =
+    untouched) softens the whole effect - long focal lengths and average
+    seeing blur real diffraction spikes more than a pixel-crisp render."""
+    out_h, out_w = out_shape
+    layer = np.zeros((out_h, out_w, 3), dtype=np.float32)
+    if not stars or view_w <= 0:
+        return layer
+    if intensity <= 0 and soft_flare <= 0 and ring_flare <= 0:
+        return layer
+
+    scale = out_w / float(view_w)
+    angles = [rotation_deg + i * (360.0 / num_rays) for i in range(num_rays)]
+    max_amp = max((a for (_, _, _, a, _c, _f) in stars), default=1.0) or 1.0
+
+    for (x, y, fwhm, amp, color, forced) in stars:
+        if fwhm < min_diameter and not forced:
+            continue
+        margin = fwhm * max(length_mult, 6.0) + fwhm
+        if not (view_x0 - margin <= x <= view_x0 + view_w + margin and
+                view_y0 - margin <= y <= view_y0 + view_h + margin):
+            continue
+        cx = (x - view_x0) * scale
+        cy = (y - view_y0) * scale
+        star_color = _rotate_hue(color, hue)
+        # Brightness follows the star's own amplitude, but relative to the
+        # single brightest star in frame every other star would be crushed
+        # near zero - a high floor keeps any qualifying star's effect
+        # clearly visible, only the very faintest ones are noticeably dimmer.
+        rel_amp = 0.55 + 0.45 * min(1.0, max(0.0, amp / max_amp))
+
+        if intensity > 0:
+            ray_len_px = fwhm * length_mult * scale
+            if ray_len_px >= 1.5:
+                # No artificial minimum here: a 0.6px floor used to make
+                # thin spikes look reassuringly thick in the heavily
+                # downsampled Fit preview, but that same floor doesn't
+                # apply at full resolution (scale=1) during Process, so the
+                # saved result came out much thinner than what the preview
+                # promised. Keeping this proportional to `scale` everywhere
+                # is what makes Fit, 100% zoom and the final Process match.
+                th_px = max(0.05, thickness * scale)
+                peak = (intensity / 100.0) * rel_amp
+                for ang in angles:
+                    _add_spike_ray(layer, cx, cy, ang, ray_len_px, th_px, peak,
+                                    star_color, chroma, rainbow, saturation)
+
+        if soft_flare > 0:
+            flare_radius_px = fwhm * 4.0 * scale
+            if flare_radius_px >= 1.0:
+                flare_peak = (soft_flare / 100.0) * rel_amp * 0.8
+                _add_soft_flare(layer, cx, cy, flare_radius_px, flare_peak)
+
+        if ring_flare > 0:
+            ring_radius_px = fwhm * 2.2 * scale
+            ring_width_px = max(0.8, fwhm * 0.35 * scale)
+            if ring_radius_px >= 1.5:
+                ring_peak = (ring_flare / 100.0) * rel_amp * 0.7
+                _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, ring_peak)
+
+    if sharpness < 100.0:
+        # Expressed in full-res pixels then scaled, same convention as
+        # length/thickness, so Fit, 100% zoom and Process all soften by the
+        # same real amount rather than an amount that depends on zoom.
+        blur_full_px = (100.0 - max(0.0, sharpness)) / 100.0 * 6.0
+        blur_px = blur_full_px * scale
+        if blur_px > 0.05:
+            layer = _blur_layer_rgb(layer, blur_px)
+
+    return np.clip(layer, 0.0, 1.0)
+
+
+def apply_spikes(rgb, layer):
+    """Screen-blend the additive (H,W,3) spike glow layer onto the image."""
+    if layer is None:
+        return rgb
+    out = rgb + layer * (1.0 - rgb)
+    return np.clip(out, 0.0, 1.0)
+
+
+class SirilWorker:
+    """Holds the connection to Siril and serializes all calls on a single thread."""
+
+    def __init__(self):
+        self.siril = s.SirilInterface()
+        self.siril.connect()
+
+    def cmd(self, *args):
+        self.siril.cmd(*args)
+
+    def log(self, msg):
+        self.siril.log(msg)
+
+    def get_wd(self):
+        """Siril's current Home/working directory (the house-shaped icon)."""
+        return os.path.normpath(self.siril.get_siril_wd())
+
+    def get_shape(self):
+        """(height, width) of the currently loaded image."""
+        _channels, h, w = self.siril.get_image_shape()
+        return h, w
+
+    def is_image_loaded(self):
+        """Whether Siril currently has a single image open - the script
+        never issues its own 'load', so this must be true before anything
+        else can work."""
+        try:
+            return bool(self.siril.is_image_loaded())
+        except Exception:
+            return False
+
+    def get_active_filename(self):
+        """Filename of the image currently open in Siril, for display only."""
+        try:
+            name = self.siril.get_image_filename()
+            return name or "(unnamed)"
+        except Exception:
+            return "(unnamed)"
+
+    def get_stars(self):
+        """Detected stars of the currently loaded image as a plain list of
+        (xpos, ypos, fwhm, amplitude) tuples in full-resolution pixels.
+        Calling findstar first (instead of relying on get_image_stars' own
+        automatic fallback) keeps detection using the same, predictable
+        default settings every time. Capped at 1000 (findstar returns the
+        most significant detections first) - a busy nebula field can
+        otherwise return tens of thousands, which is both slow to render
+        every time a slider moves and visually unreadable once that many
+        spikes overlap."""
+        self.cmd("findstar", "-maxstars=1000")
+        stars = self.siril.get_image_stars()
+        out = []
+        if stars:
+            for st in stars:
+                xpos = _star_attr(st, "xpos", "x")
+                ypos = _star_attr(st, "ypos", "y")
+                fwhm_x = _star_attr(st, "fwhm_x", "fwhmx")
+                fwhm_y = _star_attr(st, "fwhm_y", "fwhmy", default=fwhm_x)
+                fwhm = (fwhm_x + fwhm_y) / 2.0 if (fwhm_x or fwhm_y) else 0.0
+                amplitude = _star_attr(st, "amplitude", "A", default=1.0)
+                if fwhm > 0:
+                    out.append((xpos, ypos, fwhm, max(1e-6, amplitude)))
+        # We already copied everything we need into plain Python tuples -
+        # clear Siril's own star list/overlay right away instead of leaving
+        # every detected star highlighted on the image for the whole session.
+        self.clear_stars()
+        return out
+
+    def clear_stars(self):
+        """Clears the star markers findstar leaves drawn on the image."""
+        try:
+            self.cmd("clearstar")
+        except Exception:
+            pass
+
+    def fetch_full(self):
+        """Full-resolution pixel data of the image currently active in
+        Siril, as (H,W,3) float [0,1]. Fetched once (on Reload) and cached
+        by the caller: the script never issues its own 'load', so this is
+        the only place it ever reads pixels from Siril before the final
+        Process/save."""
+        data = self.siril.get_image_pixeldata(preview=False)
+        return to_hwc(to_float01(data))
+
+    def push_rgb(self, rgb_float01):
+        """Overwrite the currently active image's pixels in Siril with the
+        processed result - nothing is saved to disk here. Siril itself owns
+        save/undo for that image from this point on (Ctrl+Z, File > Save),
+        exactly like any other in-place Siril processing step - but only if
+        an undo checkpoint of the pre-frankSpikes pixels is saved first,
+        which set_image_pixeldata does not do on its own.
+
+        rgb_float01 is expected in this script's own display orientation
+        (row 0 = top, matching Siril's on-screen view) - flipped back here
+        to Siril's native bottom-up row order before writing, the opposite
+        of the flip fetch_full()'s caller applies on read."""
+        rgb_float01 = rgb_float01[::-1, :, :]
+        chw = np.transpose(np.clip(rgb_float01, 0, 1), (2, 0, 1)).astype(np.float32)
+        with self.siril.image_lock():
+            try:
+                self.siril.undo_save_state("frankSpikes")
+            except Exception:
+                pass
+            self.siril.set_image_pixeldata(chw)
+
+
+class App:
+    def __init__(self, root, worker: SirilWorker):
+        self.root = root
+        self.worker = worker
+        self.queue = queue.Queue()
+
+        self.workdir = tk.StringVar(value=self.worker.get_wd())
+        self.active_filename = tk.StringVar(value="(none)")
+        self.status = tk.StringVar(value="Reading the active image from Siril...")
+
+        self.exposure = tk.DoubleVar(value=0)
+        self.contrast = tk.DoubleVar(value=0)
+        self.blacks = tk.DoubleVar(value=0)
+        self.highlights = tk.DoubleVar(value=0)
+        self.clarity = tk.DoubleVar(value=0)
+        self.vibrance = tk.DoubleVar(value=0)
+        self.saturation = tk.DoubleVar(value=0)
+        self.temperature = tk.DoubleVar(value=0)
+        self.tint = tk.DoubleVar(value=0)
+        self.exposure_label = tk.StringVar(value="0")
+        self.contrast_label = tk.StringVar(value="0")
+        self.blacks_label = tk.StringVar(value="0")
+        self.highlights_label = tk.StringVar(value="0")
+        self.clarity_label = tk.StringVar(value="0")
+        self.vibrance_label = tk.StringVar(value="0")
+        self.saturation_label = tk.StringVar(value="0")
+        self.temperature_label = tk.StringVar(value="0")
+        self.tint_label = tk.StringVar(value="0")
+
+        d = SPIKE_DEFAULTS
+        self.spike_enabled = tk.BooleanVar(value=d["enabled"])
+        self.spike_min_diam = tk.DoubleVar(value=d["min_diam"])
+        self.spike_length = tk.DoubleVar(value=d["length"])
+        self.spike_rays = tk.IntVar(value=d["rays"])
+        self.spike_rotation = tk.DoubleVar(value=d["rotation"])
+        self.spike_intensity = tk.DoubleVar(value=d["intensity"])
+        self.spike_thickness = tk.DoubleVar(value=d["thickness"])
+        self.spike_sharpness = tk.DoubleVar(value=d["sharpness"])
+        self.spike_hue = tk.DoubleVar(value=d["hue"])
+        self.spike_chroma = tk.DoubleVar(value=d["chroma"])
+        self.spike_rainbow = tk.DoubleVar(value=d["rainbow"])
+        self.spike_saturation = tk.DoubleVar(value=d["saturation"])
+        self.spike_soft_flare = tk.DoubleVar(value=d["soft_flare"])
+        self.spike_ring_flare = tk.DoubleVar(value=d["ring_flare"])
+        self.spike_min_diam_label = tk.StringVar(value=f"{d['min_diam']:.0f}")
+        self.spike_length_label = tk.StringVar(value=f"{d['length']:.1f}x")
+        self.spike_rotation_label = tk.StringVar(value=f"{d['rotation']:.0f}")
+        self.spike_intensity_label = tk.StringVar(value=f"{d['intensity']:.0f}")
+        self.spike_thickness_label = tk.StringVar(value=f"{d['thickness']:.1f}")
+        self.spike_sharpness_label = tk.StringVar(value=f"{d['sharpness']:.0f}")
+        self.spike_hue_label = tk.StringVar(value=f"{d['hue']:.0f}")
+        self.spike_chroma_label = tk.StringVar(value=f"{d['chroma']:.0f}")
+        self.spike_rainbow_label = tk.StringVar(value=f"{d['rainbow']:.0f}")
+        self.spike_saturation_label = tk.StringVar(value=f"{d['saturation']:.0f}")
+        self.spike_soft_flare_label = tk.StringVar(value=f"{d['soft_flare']:.0f}")
+        self.spike_ring_flare_label = tk.StringVar(value=f"{d['ring_flare']:.0f}")
+
+        # Detected stars as (xpos, ypos, fwhm, amplitude, color), full-res px;
+        # color is the star's own normalized (r,g,b), see sample_star_color().
+        self._stars = []
+        self._spike_disabled = set()   # indices into self._stars excluded by the user
+        self._spike_forced = set()     # indices into self._stars forced on past min diameter
+        self._spike_manual = []    # user-added (xpos, ypos, fwhm, amplitude, color)
+
+        self._pristine_full = None  # (H,W,3) float [0,1], fetched once from Siril
+        self._src_preview_rgb = None  # raw (H,W,3) preview, before adjustments
+        self.loaded = False
+
+        self._preview_rgb = None  # (H,W,3) float [0,1] after adjustments, low-res
+        self._base_preview_rgb = None  # same, before the spike layer is composited on top
+        self._spike_layer_preview = None  # cached (ph,pw,3) spike glow layer for the Fit preview
+        self._spike_preview_after_id = None
+        self._spike_preview_gen = 0
+        self._show_original = False  # True while Space is held over the preview
+        self._tkimg = None
+        self._nav_tkimg = None
+        self._nav_geom = None  # (ox, oy, thumb_w, thumb_h) of the last-drawn thumbnail, for click mapping
+        self.zoom_mode = "fit"  # "fit" or "manual"
+        self.zoom_pct = 1.0
+        self._display_zoom_pct = 1.0  # zoom_pct is relative to the fit preview raster; this is relative to the real image, for the label
+        self.zoom_label = tk.StringVar(value="100%")
+
+        self.full_shape = None  # (h, w) of the original image
+        self.view_cx = 0.5
+        self.view_cy = 0.5
+        self._hires_rgb = None
+        self._hires_wh = None
+        self._hires_gen = 0
+        self._hires_after_id = None
+        self._siril_busy = False
+        self._busy_count = 0  # how many background renders are in flight
+        self._drag_last = None
+
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(100, self._poll_queue)
+        self.root.after(150, self._on_reload)
+
+    def _on_close(self):
+        """Safety net: get_stars() already clears the star overlay right
+        after detection, but make sure closing the window never leaves
+        every star selected on the image in Siril."""
+        try:
+            self.worker.clear_stars()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def _show_help(self):
+        """A small popup with this script's own top-of-file docstring -
+        one source of truth, no separate help text to keep in sync."""
+        win = tk.Toplevel(self.root)
+        win.title(f"frankSpikes {APP_VERSION} - Help")
+        win.configure(bg=PALETTE["bg"])
+        win.geometry("640x600")
+        win.transient(self.root)
+
+        frm = ttk.Frame(win)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        text = tk.Text(frm, wrap="word", background=PALETTE["input_bg"],
+                        foreground=PALETTE["text"], insertbackground=PALETTE["text"],
+                        relief="flat", padx=14, pady=14, font=FONT_BASE)
+        scroll = ttk.Scrollbar(frm, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        text.insert("1.0", __doc__ or "(no help text available)")
+        text.config(state="disabled")
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    # ---------- Busy indicator (progress bar) ----------
+    # A shared counter rather than a plain flag: Reload/Process, the hi-res
+    # zoom fetch and the spike-layer recompute can all be in flight at
+    # once (e.g. panning while a spike slider's debounced render is still
+    # running), and the spinner should only actually stop once every one
+    # of them has finished - not whichever happens to land last.
+    def _busy_begin(self):
+        self._busy_count += 1
+        if self._busy_count == 1:
+            self.progress.start(12)
+
+    def _busy_end(self):
+        self._busy_count = max(0, self._busy_count - 1)
+        if self._busy_count == 0:
+            self.progress.stop()
+
+    # ---------- UI ----------
+    def _make_scrollable_frame(self, parent):
+        """Wraps a Canvas + vertical Scrollbar around a plain Frame, so its
+        content becomes scrollable whenever the window is resized shorter
+        than what the sidebar actually needs - the scrollbar only appears
+        when it's actually needed, not all the time. Returns (outer, inner):
+        grid/pack `outer` into the layout, put actual content into `inner`
+        exactly as if it were a plain Frame."""
+        outer = ttk.Frame(parent)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, background=PALETTE["bg"], highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        inner = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            if inner.winfo_reqheight() > canvas.winfo_height():
+                vbar.grid(row=0, column=1, sticky="ns")
+            else:
+                vbar.grid_remove()
+
+        inner.bind("<Configure>", _sync)
+        canvas.bind("<Configure>", _sync)
+
+        def _on_wheel(event):
+            if inner.winfo_reqheight() <= canvas.winfo_height():
+                return  # nothing to scroll - let the event pass through
+            delta = event.delta if event.delta else (120 if event.num == 4 else -120)
+            canvas.yview_scroll(int(-delta / 120), "units")
+
+        canvas._cosmetics_wheel_handler = _on_wheel  # picked up by _bind_wheel_recursive
+        canvas._cosmetics_inner = inner
+        return outer, inner, canvas
+
+    def _bind_wheel_recursive(self, canvas):
+        """Mouse-wheel scrolling only fires on the exact widget under the
+        cursor in Tk - with real controls (sliders, buttons, labels...)
+        covering almost the entire scrollable area, binding only the
+        canvas itself would mean the wheel does nothing anywhere useful.
+        Binds every descendant of the canvas's embedded frame instead."""
+        handler = canvas._cosmetics_wheel_handler
+
+        def _bind(widget):
+            widget.bind("<MouseWheel>", handler, add="+")
+            widget.bind("<Button-4>", handler, add="+")
+            widget.bind("<Button-5>", handler, add="+")
+            for child in widget.winfo_children():
+                _bind(child)
+
+        _bind(canvas._cosmetics_inner)
+
+    def _build_ui(self):
+        P = PALETTE
+        setup_style(self.root)
+        pad = {"padx": 8, "pady": 5}
+
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+
+        # ---- Header ----
+        frm_header = ttk.Frame(self.root)
+        frm_header.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 6))
+        frm_header.grid_columnconfigure(0, weight=1)
+
+        title_box = ttk.Frame(frm_header)
+        title_box.grid(row=0, column=0, sticky="w")
+        ttk.Label(title_box, text=f"frankSpikes {APP_VERSION}", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(title_box, text="Light, tone and color adjustments, plus realistic "
+                                   "diffraction spikes, via Siril",
+                  style="SubHeader.TLabel").pack(anchor="w")
+
+        ttk.Button(frm_header, text="Help", style="Toolbar.TButton",
+                   command=self._show_help).grid(row=0, column=1, sticky="e", padx=(0, 8))
+
+        badge = ttk.Label(frm_header, text="\U0001F4D8 by Frank Sferlazza", style="Badge.TLabel",
+                           cursor="hand2")
+        badge.grid(row=0, column=2, sticky="e")
+        badge.bind("<Button-1>", lambda _e: webbrowser.open(FACEBOOK_URL))
+
+        # ---- Body: parameters (left) + preview (right) ----
+        frm_main = ttk.Frame(self.root)
+        frm_main.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 6))
+        frm_main.grid_rowconfigure(1, weight=1)
+        frm_main.grid_columnconfigure(1, weight=1)
+
+        ctrl_outer, frm_ctrl, self._ctrl_canvas = self._make_scrollable_frame(frm_main)
+        ctrl_outer.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
+
+        frm_light = ttk.LabelFrame(frm_ctrl, text="Light & Tones")
+        frm_light.pack(fill="x", pady=(0, 10))
+        frm_light.grid_columnconfigure(0, minsize=230)
+        self._add_slider(frm_light, 0, "Exposure", self.exposure, self.exposure_label, -100, 100, step=1)
+        self._add_slider(frm_light, 2, "Contrast", self.contrast, self.contrast_label, -100, 100, step=1)
+        self._add_slider(frm_light, 4, "Blacks / Sky Background",
+                          self.blacks, self.blacks_label, -100, 100, step=1)
+        self._add_slider(frm_light, 6, "Highlights / Whites",
+                          self.highlights, self.highlights_label, -100, 100, step=1)
+        self._add_slider(frm_light, 8, "Clarity (local contrast)",
+                          self.clarity, self.clarity_label, -100, 100, step=1)
+
+        frm_color = ttk.LabelFrame(frm_ctrl, text="Color & Hue")
+        frm_color.pack(fill="x")
+        frm_color.grid_columnconfigure(0, minsize=230)
+        self._add_slider(frm_color, 0, "Vibrance",
+                          self.vibrance, self.vibrance_label, -100, 100, step=1)
+        self._add_slider(frm_color, 2, "Saturation",
+                          self.saturation, self.saturation_label, -100, 100, step=1)
+        self._add_slider(frm_color, 4, "Temperature (cool / warm)",
+                          self.temperature, self.temperature_label, -50, 50, step=0.5)
+        self._add_slider(frm_color, 6, "Tint (green / magenta)",
+                          self.tint, self.tint_label, -50, 50, step=0.5)
+
+        self.btn_process = ttk.Button(frm_ctrl, text="Process and import in Siril",
+                                       style="Accent.TButton",
+                                       command=self._on_process, state="disabled")
+        self.btn_process.pack(fill="x", pady=(18, 0))
+
+        # ---- Navigator: thumbnail + draggable viewport rectangle ----
+        frm_nav = ttk.LabelFrame(frm_ctrl, text="Navigator")
+        frm_nav.pack(fill="x", pady=(14, 0))
+        self.nav_canvas = tk.Canvas(frm_nav, background=P["trough"], highlightthickness=0,
+                                     width=NAV_MAX_W, height=NAV_MAX_H)
+        self.nav_canvas.pack(padx=10, pady=10)
+        self.nav_canvas.bind("<ButtonPress-1>", self._on_nav_click)
+        self.nav_canvas.bind("<B1-Motion>", self._on_nav_click)
+
+        # ---- Zoom "pill" toolbar ----
+        frm_toolbar = ttk.Frame(frm_main, style="Toolbar.TFrame")
+        frm_toolbar.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        for txt, cmd in (("−", self._zoom_out), ("Fit", self._zoom_fit),
+                          ("100%", self._zoom_1to1), ("+", self._zoom_in)):
+            ttk.Button(frm_toolbar, text=txt, style="Toolbar.TButton", width=5,
+                       command=cmd).pack(side="left", padx=(0, 1), pady=6)
+        ttk.Label(frm_toolbar, textvariable=self.zoom_label, style="ZoomPct.TLabel",
+                  width=6, anchor="center").pack(side="left", padx=(10, 0))
+        ttk.Label(frm_toolbar, text="Fit: fast low-res preview — 100%/+/-: real full-resolution"
+                                     " crop (drag, scroll wheel, or the scrollbars to pan)",
+                  style="CardMuted.TLabel").pack(side="left", padx=(16, 0))
+
+        # highlightthickness=0: with it >0, winfo_width()/height() include
+        # the border in their count while canvas item coordinates and
+        # mouse events don't - a small but real (2 * thickness) source of
+        # drift between the click math and what's actually drawn.
+        self.preview_canvas = tk.Canvas(frm_main, background=P["trough"], highlightthickness=0,
+                                         width=600, height=500)
+        self.preview_canvas.grid(row=1, column=1, sticky="nsew")
+        self.preview_canvas.create_text(
+            16, 16, anchor="nw", tags="placeholder", fill=P["muted"],
+            text="(no preview yet)")
+        self.preview_canvas.bind("<Configure>", self._on_canvas_resize)
+        self.preview_canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.preview_canvas.bind("<MouseWheel>", self._on_canvas_wheel)  # Windows/Mac
+        self.preview_canvas.bind("<Button-4>", self._on_canvas_wheel)  # Linux, up
+        self.preview_canvas.bind("<Button-5>", self._on_canvas_wheel)  # Linux, down
+        # Bound on the canvas itself (which grabs keyboard focus on hover)
+        # rather than the whole window, so holding Space doesn't also
+        # invoke whatever Checkbutton/Radiobutton happens to have focus.
+        self.preview_canvas.bind("<Enter>", lambda _e: self.preview_canvas.focus_set())
+        self.preview_canvas.bind("<KeyPress-space>", self._on_space_press)
+        self.preview_canvas.bind("<KeyRelease-space>", self._on_space_release)
+
+        self.vbar = ttk.Scrollbar(frm_main, orient="vertical", command=self._on_vscroll)
+        self.vbar.grid(row=1, column=2, sticky="ns")
+        self.hbar = ttk.Scrollbar(frm_main, orient="horizontal", command=self._on_hscroll)
+        self.hbar.grid(row=2, column=1, sticky="ew")
+
+        # ---- Diffraction spikes panel: right of the image, not stacked
+        # under A)/B) on the left, so the window doesn't grow very tall. ----
+        frm_spikes_outer = ttk.LabelFrame(frm_main, text="Diffraction Spikes")
+        frm_spikes_outer.grid(row=0, column=3, rowspan=3, sticky="nsew", padx=(8, 0))
+        frm_spikes_outer.grid_rowconfigure(0, weight=1)
+        frm_spikes_outer.grid_columnconfigure(0, weight=1)
+        spikes_scroll, frm_spikes, self._spikes_canvas = self._make_scrollable_frame(frm_spikes_outer)
+        spikes_scroll.grid(row=0, column=0, sticky="nsew")
+        frm_spikes.grid_columnconfigure(0, minsize=230)
+
+        ttk.Checkbutton(frm_spikes, text="Enable spikes", variable=self.spike_enabled,
+                         command=self._on_spike_slider).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4))
+
+        self._add_slider(frm_spikes, 1, "Min star diameter (px)",
+                          self.spike_min_diam, self.spike_min_diam_label, 1, 30,
+                          step=1, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 3, "Spike length (x star diameter)",
+                          self.spike_length, self.spike_length_label, 2, 50,
+                          step=0.5, on_change=self._on_spike_slider)
+
+        ttk.Label(frm_spikes, text="Number of rays", style="Card.TLabel").grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 0))
+        rays_box = ttk.Frame(frm_spikes, style="Card.TFrame")
+        rays_box.grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
+        ttk.Radiobutton(rays_box, text="4 (refractor / 2-vane spider)", value=4,
+                         variable=self.spike_rays, command=self._on_spike_slider).pack(anchor="w")
+        ttk.Radiobutton(rays_box, text="6 (3-vane spider, e.g. Newtonian)", value=6,
+                         variable=self.spike_rays, command=self._on_spike_slider).pack(anchor="w")
+
+        self._add_slider(frm_spikes, 7, "Rotation angle (0-90 deg)",
+                          self.spike_rotation, self.spike_rotation_label, 0, 90,
+                          step=1, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 9, "Intensity",
+                          self.spike_intensity, self.spike_intensity_label, 0, 200,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 11, "Thickness",
+                          self.spike_thickness, self.spike_thickness_label, 0.3, 6,
+                          step=0.1, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 13, "Sharpness (lower = softer, for long focal lengths)",
+                          self.spike_sharpness, self.spike_sharpness_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 15, "Soft flare",
+                          self.spike_soft_flare, self.spike_soft_flare_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 17, "Ring flare",
+                          self.spike_ring_flare, self.spike_ring_flare_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 19, "Color hue (each spike keeps its star's colour)",
+                          self.spike_hue, self.spike_hue_label, -180, 180,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 21, "Color fringing (chromatic)",
+                          self.spike_chroma, self.spike_chroma_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 23, "Rainbow intensity",
+                          self.spike_rainbow, self.spike_rainbow_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 25, "Color saturation",
+                          self.spike_saturation, self.spike_saturation_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
+
+        ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left",
+                  text="Ctrl+Click a star in the preview to remove/restore\n"
+                       "its spikes, or Ctrl+Click empty space to add one.\n"
+                       "Judge Thickness at 100% zoom, not Fit - thin spikes\n"
+                       "can vanish into a few pixels once downsampled.").grid(
+            row=27, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+        ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
+                   command=self._reset_spike_edits).grid(
+            row=28, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+        ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
+                   command=self._reset_spike_defaults).grid(
+            row=29, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+
+        # ---- Status bar ----
+        frm_status = ttk.Frame(self.root, style="Card.TFrame")
+        frm_status.grid(row=2, column=0, sticky="ew")
+        frm_status.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(frm_status, textvariable=self.status, style="Status.TLabel").grid(
+            row=0, column=0, sticky="w", padx=12, pady=8)
+        self.progress = ttk.Progressbar(frm_status, mode="indeterminate")
+        self.progress.grid(row=0, column=1, sticky="ew", padx=12, pady=8)
+        ttk.Label(frm_status, text="Space Bar - Original view",
+                  style="CardMuted.TLabel").grid(row=0, column=2, sticky="e", padx=12, pady=8)
+        ttk.Label(frm_status, text=f"frankSpikes {APP_VERSION} — by Frank Sferlazza",
+                  style="CardMuted.TLabel").grid(row=0, column=3, sticky="e", padx=12, pady=8)
+
+        # Both sidebars are now built - fix each scrollable canvas's size
+        # to its content's real natural size (a bare Canvas doesn't
+        # auto-size to an embedded window the way a Frame would). Height
+        # matters here too, not just width: leaving it at Tk's small
+        # default would make main()'s window-sizing logic think the
+        # sidebars need far less room than they do, and the window would
+        # open already needing to scroll instead of only after the user
+        # manually resizes it shorter. Also wires up wheel-scrolling
+        # across every widget inside them.
+        self.root.update_idletasks()
+        for canvas in (self._ctrl_canvas, self._spikes_canvas):
+            inner = canvas._cosmetics_inner
+            canvas.configure(width=inner.winfo_reqwidth(), height=inner.winfo_reqheight())
+            self._bind_wheel_recursive(canvas)
+
+    def _add_slider(self, parent, row, label, var, label_var, lo, hi, step=1.0, on_change=None):
+        ttk.Label(parent, text=label, style="Card.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 0))
+        cmd = on_change or self._on_tone_slider
+        ttk.Scale(parent, from_=lo, to=hi, variable=var,
+                  command=lambda _e: cmd()).grid(
+            row=row + 1, column=0, sticky="ew", padx=(10, 4))
+        ttk.Label(parent, textvariable=label_var, style="Card.TLabel", width=5).grid(
+            row=row + 1, column=1, padx=(0, 2))
+
+        def _bump(delta):
+            new_val = round(min(hi, max(lo, var.get() + delta)), 4)
+            var.set(new_val)
+            cmd()
+
+        spin = ttk.Frame(parent, style="Card.TFrame")
+        spin.grid(row=row + 1, column=2, padx=(0, 10), sticky="ns")
+        ttk.Button(spin, text="▲", style="Spin.TButton", width=2,
+                   command=lambda: _bump(step)).pack(side="top", fill="x")
+        ttk.Button(spin, text="▼", style="Spin.TButton", width=2,
+                   command=lambda: _bump(-step)).pack(side="top", fill="x")
+
+    # ---------- Reload from Siril (background thread) ----------
+    def _on_reload(self):
+        self.btn_process.config(state="disabled")
+        self._busy_begin()
+        self._siril_busy = True
+        t = threading.Thread(target=self._reload_thread, daemon=True)
+        t.start()
+
+    def _reload_thread(self):
+        try:
+            self.worker.log(f"frankSpikes {APP_VERSION}")
+
+            if not self.worker.is_image_loaded():
+                self.queue.put(("error", "No image is currently open in Siril.\n\n"
+                                          "Open the image you want to edit in Siril, "
+                                          "then run this script again."))
+                return
+
+            filename = self.worker.get_active_filename()
+            self.worker.log(f"active image={filename!r}")
+
+            self.queue.put(("status", "Detecting stars for diffraction spikes..."))
+            try:
+                stars = self.worker.get_stars()
+                self.worker.log(f"frankSpikes: {len(stars)} stars detected"
+                                 + (f", brightest fwhm={max(s[2] for s in stars):.1f}px"
+                                    if stars else ""))
+            except Exception as e:
+                self.worker.log(f"frankSpikes: star detection failed, spikes disabled: {e}")
+                stars = []
+
+            self.queue.put(("status", "Reading the active image from Siril..."))
+            full_rgb = self.worker.fetch_full()
+            full_shape = full_rgb.shape[:2]
+            preview_rgb = downsample(full_rgb)
+
+            if stars:
+                # Confirmed empirically (not guessed - a user screenshot
+                # showed spikes for a bottom-of-frame star rendering at the
+                # top, a clean vertical mirror): get_image_stars()'s ypos
+                # is reported in top-down (display) convention, while
+                # get_image_pixeldata() - and so full_rgb here - is still
+                # in Siril's raw bottom-up FITS row order at this point.
+                # Convert to that same raw convention up front so refine/
+                # colour-sampling below (which read pixels straight out of
+                # full_rgb) use coordinates that actually land on the star;
+                # the single flip applied to image+stars together further
+                # down (raw -> display) then converts back, so the stored
+                # result ends up in display convention as it should.
+                # An earlier version tried to detect this per-image with a
+                # single star's single-pixel brightness test instead of
+                # applying it unconditionally - unreliable in a nebulous
+                # field, since both candidate rows can plausibly be bright.
+                fh, fw = full_shape
+                stars = [(x, fh - 1.0 - y, fw_, a) for (x, y, fw_, a) in stars]
+
+                # findstar's photometric centroid can be pulled slightly off
+                # the star's actual visual peak by nearby nebulosity or a
+                # neighbouring star - snap to the true local brightness peak
+                # so spikes/flares centre on what the eye sees, not a fit
+                # that structure around the star can bias.
+                refined = []
+                shifts = []
+                for (x, y, fw_, a) in stars:
+                    rx, ry = refine_star_position(full_rgb, x, y, fw_)
+                    shifts.append(((rx - x) ** 2 + (ry - y) ** 2) ** 0.5)
+                    refined.append((rx, ry, fw_, a))
+                stars = refined
+                if shifts:
+                    self.worker.log(f"frankSpikes: position refinement shift - "
+                                     f"max={max(shifts):.1f}px avg={sum(shifts)/len(shifts):.1f}px "
+                                     f"(a large max here, relative to typical star fwhm, usually "
+                                     f"means refinement latched onto nearby nebula/a neighbour "
+                                     f"instead of the star itself)")
+
+                # Real diffraction spikes take on their own star's colour,
+                # not a flat white glow - sample it once now from the
+                # full-resolution pixels while we have them.
+                stars = [(x, y, fw_, a, sample_star_color(full_rgb, x, y, fw_))
+                         for (x, y, fw_, a) in stars]
+
+            # Siril always reads/displays FITS rows bottom-up, while PIL and
+            # this script's Tkinter canvas assume row 0 is the top - without
+            # this, the preview showed the image upside down relative to
+            # Siril's own window. Flip the image and the (already mutually
+            # aligned) stars together here so this script's own view of the
+            # world matches what's on screen in Siril; push_rgb() flips the
+            # processed result back before writing it, since Siril expects
+            # pixel data in its own native row order.
+            fh, fw = full_shape
+            full_rgb = full_rgb[::-1, :, :].copy()
+            preview_rgb = preview_rgb[::-1, :, :].copy()
+            if stars:
+                stars = [(x, fh - 1.0 - y, fw_, a, color) for (x, y, fw_, a, color) in stars]
+
+            self.queue.put(("loaded", (filename, full_rgb, preview_rgb, full_shape, stars)))
+            self.queue.put(("status", "Ready. Adjust the sliders."))
+        except Exception as e:
+            self.queue.put(("error", format_error(e)))
+
+    # ---------- Live preview (pure numpy, no Siril calls) ----------
+    def _update_all_labels(self):
+        self.exposure_label.set(f"{self.exposure.get():.0f}")
+        self.contrast_label.set(f"{self.contrast.get():.0f}")
+        self.blacks_label.set(f"{self.blacks.get():.0f}")
+        self.highlights_label.set(f"{self.highlights.get():.0f}")
+        self.clarity_label.set(f"{self.clarity.get():.0f}")
+        self.vibrance_label.set(f"{self.vibrance.get():.0f}")
+        self.saturation_label.set(f"{self.saturation.get():.0f}")
+        self.temperature_label.set(f"{self.temperature.get():.1f}")
+        self.tint_label.set(f"{self.tint.get():.1f}")
+        self.spike_min_diam_label.set(f"{self.spike_min_diam.get():.0f}")
+        self.spike_length_label.set(f"{self.spike_length.get():.1f}x")
+        self.spike_rotation_label.set(f"{self.spike_rotation.get():.0f}")
+        self.spike_intensity_label.set(f"{self.spike_intensity.get():.0f}")
+        self.spike_thickness_label.set(f"{self.spike_thickness.get():.1f}")
+        self.spike_sharpness_label.set(f"{self.spike_sharpness.get():.0f}")
+        self.spike_hue_label.set(f"{self.spike_hue.get():.0f}")
+        self.spike_chroma_label.set(f"{self.spike_chroma.get():.0f}")
+        self.spike_rainbow_label.set(f"{self.spike_rainbow.get():.0f}")
+        self.spike_saturation_label.set(f"{self.spike_saturation.get():.0f}")
+        self.spike_soft_flare_label.set(f"{self.spike_soft_flare.get():.0f}")
+        self.spike_ring_flare_label.set(f"{self.spike_ring_flare.get():.0f}")
+
+    def _on_tone_slider(self):
+        """Light & Tones / Color & Hue sliders: cheap, so recompute and
+        redraw immediately. Spikes are independent of these params, so the
+        last computed spike layer is simply reused rather than recomputed -
+        this used to be the main cause of sluggish dragging, since every
+        single tick was re-rendering spikes from scratch regardless of
+        which slider actually moved."""
+        self._update_all_labels()
+        if not self.loaded:
+            return
+        self._render_preview()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
+
+    def _on_spike_slider(self):
+        """Diffraction Spikes sliders: the spike layer itself is the
+        expensive part (per-star geometry, optional supersampling/blur), so
+        it's recomputed in the background and debounced rather than
+        blocking the UI thread on every drag tick."""
+        self._update_all_labels()
+        if not self.loaded:
+            return
+        self._schedule_spike_preview()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
+
+    def _slider_values(self):
+        return (self.exposure.get(), self.temperature.get(), self.tint.get(),
+                self.contrast.get(), self.blacks.get(), self.highlights.get(),
+                self.clarity.get(), self.vibrance.get(), self.saturation.get())
+
+    def _spike_params(self):
+        return (self.spike_min_diam.get(), self.spike_length.get(),
+                int(self.spike_rays.get()), self.spike_rotation.get(),
+                self.spike_intensity.get(), self.spike_thickness.get(),
+                self.spike_hue.get(), self.spike_chroma.get(), self.spike_rainbow.get(),
+                self.spike_saturation.get(), self.spike_soft_flare.get(),
+                self.spike_ring_flare.get(), self.spike_sharpness.get())
+
+    def _effective_stars(self):
+        """Detected stars minus any the user disabled, plus any manually
+        added ones - the exact (x,y,fwhm,amp,color,forced) list that goes
+        into rendering. `forced` bypasses the min-diameter cutoff: it's set
+        for stars the user explicitly turned on with Ctrl+Click even though
+        they're smaller than the current threshold, and always set for
+        manually-added ones (there's no "detected size" to filter by)."""
+        out = []
+        for i, (x, y, fwhm, amp, color) in enumerate(self._stars):
+            if i in self._spike_disabled:
+                continue
+            out.append((x, y, fwhm, amp, color, i in self._spike_forced))
+        for (x, y, fwhm, amp, color) in self._spike_manual:
+            out.append((x, y, fwhm, amp, color, True))
+        return out
+
+    def _reset_spike_edits(self):
+        self._spike_disabled.clear()
+        self._spike_forced.clear()
+        self._spike_manual.clear()
+        if self.loaded:
+            self._schedule_spike_preview()
+
+    def _reset_spike_defaults(self):
+        """Resets the spike sliders to SPIKE_DEFAULTS - leaves per-star
+        Ctrl+Click edits (disabled/forced/manual stars) untouched, that's
+        what "Reset manual edits" is for."""
+        d = SPIKE_DEFAULTS
+        self.spike_enabled.set(d["enabled"])
+        self.spike_min_diam.set(d["min_diam"])
+        self.spike_length.set(d["length"])
+        self.spike_rays.set(d["rays"])
+        self.spike_rotation.set(d["rotation"])
+        self.spike_intensity.set(d["intensity"])
+        self.spike_thickness.set(d["thickness"])
+        self.spike_sharpness.set(d["sharpness"])
+        self.spike_hue.set(d["hue"])
+        self.spike_chroma.set(d["chroma"])
+        self.spike_rainbow.set(d["rainbow"])
+        self.spike_saturation.set(d["saturation"])
+        self.spike_soft_flare.set(d["soft_flare"])
+        self.spike_ring_flare.set(d["ring_flare"])
+        self._on_spike_slider()
+
+    def _spike_supersample(self, ph, pw):
+        """How much to render the spike layer oversized before area-
+        averaging it down to the low-res Fit preview's (ph, pw). Evaluating
+        a thin ray's gaussian profile directly on a sparse grid makes its
+        apparent thickness AND brightness depend on where it happens to
+        land between raster pixels (aliasing) - rendering a few times
+        larger and properly downsampling avoids that, at a bounded cost."""
+        fh, fw = self.full_shape
+        scale = pw / max(fw, 1)
+        th = self.spike_thickness.get() * scale
+        if th >= 0.5:
+            return 1
+        return int(min(4, max(1, np.ceil(0.5 / max(th, 1e-3)))))
+
+    def _render_preview(self):
+        """Recompute only the cheap tone/colour grading and redraw, reusing
+        whatever spike layer is already cached - the spike layer itself is
+        recomputed separately (see _schedule_spike_preview), since it's the
+        expensive part and doesn't depend on these sliders at all."""
+        self._base_preview_rgb = apply_cosmetics(self._src_preview_rgb, *self._slider_values())
+        self._compose_preview()
+        self._redraw_canvas()
+
+    def _compose_preview(self):
+        rgb = self._base_preview_rgb
+        if self.spike_enabled.get() and self._spike_layer_preview is not None:
+            rgb = apply_spikes(rgb, self._spike_layer_preview)
+        self._preview_rgb = rgb
+
+    def _schedule_spike_preview(self):
+        """Debounced, backgrounded spike-layer recompute for the Fit
+        preview - mirrors _schedule_hires_fetch's pattern so a rapid drag
+        across a spike slider doesn't queue up dozens of expensive renders,
+        only the last one after a short pause."""
+        if self._spike_preview_after_id is not None:
+            self.root.after_cancel(self._spike_preview_after_id)
+        self._spike_preview_after_id = self.root.after(150, self._start_spike_preview)
+
+    def _start_spike_preview(self):
+        self._spike_preview_after_id = None
+        if not self.loaded or self._base_preview_rgb is None:
+            return
+        self._spike_preview_gen += 1
+        gen = self._spike_preview_gen
+
+        if not self.spike_enabled.get():
+            self._spike_layer_preview = None
+            self._compose_preview()
+            self._redraw_canvas()
+            return
+
+        stars = self._effective_stars()
+        if not stars:
+            self._spike_layer_preview = None
+            self._compose_preview()
+            self._redraw_canvas()
+            return
+
+        ph, pw = self._base_preview_rgb.shape[:2]
+        fh, fw = self.full_shape
+        params = self._spike_params()
+        ss = self._spike_supersample(ph, pw)
+        self._busy_begin()
+        t = threading.Thread(target=self._spike_preview_thread,
+                              args=(gen, ph, pw, fh, fw, stars, params, ss), daemon=True)
+        t.start()
+
+    def _spike_preview_thread(self, gen, ph, pw, fh, fw, stars, params, ss):
+        # Always post something, success or failure - _poll_queue's
+        # "spike_preview" handler pairs every message here with the
+        # _busy_begin() this thread's launch made, so the busy spinner
+        # would otherwise spin forever after a failed render.
+        layer = None
+        try:
+            if ss > 1:
+                layer = render_spike_layer((ph * ss, pw * ss), 0, 0, fw, fh, stars, *params)
+                layer = resize_layer(layer, pw, ph)
+            else:
+                layer = render_spike_layer((ph, pw), 0, 0, fw, fh, stars, *params)
+        except Exception as e:
+            try:
+                self.worker.log(f"frankSpikes: spike preview render failed: {e}")
+            except Exception:
+                pass
+        self.queue.put(("spike_preview", (gen, layer)))
+
+    # ---------- Zoom / pan / canvas ----------
+    # In "fit" mode the low-resolution raster is always shown (that's fine:
+    # the whole image squeezed into the window can't show more detail than
+    # that anyway). In "manual" mode (+/-/100%) only the [x,y,w,h] crop
+    # needed to fill the canvas is fetched from Siril in the background, at
+    # full resolution: a real pixel-for-pixel zoom without having to
+    # transfer the whole image on every move.
+
+    def _on_canvas_resize(self, _event):
+        self._redraw_canvas()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
+
+    def _zoom_in(self):
+        self.zoom_mode = "manual"
+        self.zoom_pct = min(self.zoom_pct * 1.25, 8.0)
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    def _zoom_out(self):
+        self.zoom_mode = "manual"
+        self.zoom_pct = max(self.zoom_pct / 1.25, 0.1)
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    def _zoom_1to1(self):
+        self.zoom_mode = "manual"
+        self.zoom_pct = 1.0
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    def _zoom_fit(self):
+        self.zoom_mode = "fit"
+        self._hires_rgb = None
+        self._hires_wh = None
+        self._redraw_canvas()
+
+    def _on_canvas_press(self, event):
+        # Handled here (checking the Control bit directly) rather than via a
+        # separate <Control-Button-1> binding: on some Windows/Tk builds a
+        # plain <ButtonPress-1> binding on the same widget still fires
+        # alongside the modifier-qualified one, which made Ctrl+Click
+        # silently toggle a spike on and back off in the same click.
+        if event.state & 0x0004:  # Control key held
+            self._on_canvas_ctrl_click(event)
+            return
+        self._drag_last = (event.x, event.y)
+
+    def _on_space_press(self, event):
+        # Guard against key-repeat (holding the key fires repeated
+        # KeyPress events on most platforms) triggering redundant redraws.
+        if self._show_original or self.full_shape is None:
+            return
+        self._show_original = True
+        self._redraw_canvas()
+
+    def _on_space_release(self, event):
+        if not self._show_original:
+            return
+        self._show_original = False
+        self._redraw_canvas()
+
+    def _on_canvas_drag(self, event):
+        if self.zoom_mode != "manual" or self.full_shape is None or self._drag_last is None:
+            return
+        dx = event.x - self._drag_last[0]
+        dy = event.y - self._drag_last[1]
+        self._drag_last = (event.x, event.y)
+        fh, fw = self.full_shape
+        # dragging right must move the view to the left
+        self.view_cx = min(1.0, max(0.0, self.view_cx - dx / max(1, fw * self.zoom_pct)))
+        self.view_cy = min(1.0, max(0.0, self.view_cy - dy / max(1, fh * self.zoom_pct)))
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    def _on_canvas_wheel(self, event):
+        if self.zoom_mode != "manual" or self.full_shape is None:
+            return
+        delta = event.delta if event.delta else (120 if event.num == 4 else -120)
+        step = -delta / 120 * 60  # ~60px of scroll per notch
+        fh, fw = self.full_shape
+        shift_horizontal = bool(event.state & 0x0001)  # Shift key
+        if shift_horizontal:
+            self.view_cx = min(1.0, max(0.0, self.view_cx + step / max(1, fw * self.zoom_pct)))
+        else:
+            self.view_cy = min(1.0, max(0.0, self.view_cy + step / max(1, fh * self.zoom_pct)))
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    def _canvas_to_full(self, cx, cy):
+        """Screen coordinates on the preview canvas -> full-resolution image
+        pixel coordinates, using whichever raster (fit or hi-res crop) is
+        actually on screen right now. Returns (None, None) if the click
+        landed outside the displayed image."""
+        canvas = self.preview_canvas
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        fh, fw = self.full_shape
+
+        if self.zoom_mode == "fit":
+            ph, pw = self._preview_rgb.shape[:2]
+            # Must match _redraw_canvas's fit-branch sizing exactly (also
+            # int(round(...)), not a bare float) - even a sub-pixel gap
+            # between the two gets multiplied by fw/pw when converting back
+            # to full-res coordinates, which can be a factor of several x
+            # once PREVIEW_MAX_W is much smaller than the real image width,
+            # turning a harmless rounding difference into a visibly
+            # mis-clicked star position.
+            disp_w = max(1, int(round(pw * self.zoom_pct)))
+            disp_h = max(1, int(round(ph * self.zoom_pct)))
+            ox, oy = cw / 2 - disp_w / 2, ch / 2 - disp_h / 2
+            ix, iy = (cx - ox) / self.zoom_pct, (cy - oy) / self.zoom_pct
+            if not (0 <= ix < pw and 0 <= iy < ph):
+                return None, None
+            return ix * fw / pw, iy * fh / ph
+
+        x0, y0, crop_w, crop_h = self._compute_crop(cw, ch)
+        actual_w, actual_h = self._hires_wh if self._hires_wh is not None else (crop_w, crop_h)
+        # Same reasoning as the fit branch above - match _redraw_canvas's
+        # manual-mode sizing exactly.
+        disp_w = max(1, int(round(actual_w * self.zoom_pct)))
+        disp_h = max(1, int(round(actual_h * self.zoom_pct)))
+        ox, oy = cw / 2 - disp_w / 2, ch / 2 - disp_h / 2
+        ix, iy = (cx - ox) / self.zoom_pct, (cy - oy) / self.zoom_pct
+        if not (0 <= ix < actual_w and 0 <= iy < actual_h):
+            return None, None
+        return x0 + ix * crop_w / actual_w, y0 + iy * crop_h / actual_h
+
+    def _find_nearby_star(self, fx, fy):
+        """Nearest detected or manually-added star within a small, fixed
+        hit radius of (fx, fy), as ("auto"|"manual", index), or None.
+
+        The radius used to be max(6px, the star's own fwhm) - fwhm is the
+        star's optical size, not a sensible click tolerance, so a big
+        bright star (fwhm 30-40px, sometimes 100+ for a heavily saturated
+        one) turned into a huge "sticky" zone around it: any click within
+        that whole radius silently snapped to the star's own stored
+        position and toggled it, instead of landing precisely where the
+        user actually clicked. A fixed small radius means only a click
+        genuinely close to a star's position hits it; anything else adds a
+        new manual spike exactly at the click, as intended."""
+        HIT_RADIUS_PX = 10.0
+        best, best_d = None, None
+        for i, (x, y, _fwhm, _amp, _color) in enumerate(self._stars):
+            d = ((x - fx) ** 2 + (y - fy) ** 2) ** 0.5
+            if d <= HIT_RADIUS_PX and (best_d is None or d < best_d):
+                best, best_d = ("auto", i), d
+        for i, (x, y, _fwhm, _amp, _color) in enumerate(self._spike_manual):
+            d = ((x - fx) ** 2 + (y - fy) ** 2) ** 0.5
+            if d <= HIT_RADIUS_PX and (best_d is None or d < best_d):
+                best, best_d = ("manual", i), d
+        return best
+
+    def _on_canvas_ctrl_click(self, event):
+        if not self.loaded or self.full_shape is None:
+            return
+        cw, ch = self.preview_canvas.winfo_width(), self.preview_canvas.winfo_height()
+        fx, fy = self._canvas_to_full(event.x, event.y)
+        if fx is None:
+            self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) "
+                             f"canvas={cw}x{ch} zoom_mode={self.zoom_mode} "
+                             f"zoom_pct={self.zoom_pct:.4f} -> outside the displayed image, ignored")
+            return
+        hit = self._find_nearby_star(fx, fy)
+        if hit is not None:
+            kind, i = hit
+            if kind == "manual":
+                hx, hy, hfwhm, _a, _c = self._spike_manual[i]
+                self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) -> "
+                                 f"full-res ({fx:.1f},{fy:.1f}) - removed MANUAL spike #{i} "
+                                 f"at ({hx:.1f},{hy:.1f}) fwhm={hfwhm:.1f} "
+                                 f"[distance from click: {((hx-fx)**2+(hy-fy)**2)**0.5:.1f}px]")
+                del self._spike_manual[i]
+            else:
+                hx, hy, fwhm, _amp, _color = self._stars[i]
+                self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) -> "
+                                 f"full-res ({fx:.1f},{fy:.1f}) - matched AUTO star #{i} at "
+                                 f"({hx:.1f},{hy:.1f}) fwhm={fwhm:.1f} "
+                                 f"[distance from click: {((hx-fx)**2+(hy-fy)**2)**0.5:.1f}px] "
+                                 f"- toggling that star, NOT adding a new one at the click point")
+                # A star findstar detected can still be below the current
+                # min-diameter threshold, so "is it currently showing a
+                # spike" depends on more than just the disabled set.
+                showing = (i not in self._spike_disabled and
+                           (fwhm >= self.spike_min_diam.get() or i in self._spike_forced))
+                if showing:
+                    self._spike_disabled.add(i)
+                    self._spike_forced.discard(i)
+                else:
+                    self._spike_disabled.discard(i)
+                    self._spike_forced.add(i)
+        else:
+            default_fwhm = max(3.0, self.spike_min_diam.get() * 1.5)
+            self._spike_manual.append((fx, fy, default_fwhm, 1.0, (1.0, 1.0, 1.0)))
+            self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) "
+                             f"canvas={cw}x{ch} zoom_mode={self.zoom_mode} "
+                             f"zoom_pct={self.zoom_pct:.4f} -> full-res ({fx:.1f},{fy:.1f}) "
+                             f"- added a NEW manual spike exactly there")
+        self._schedule_spike_preview()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
+
+    def _on_hscroll(self, *args):
+        self._scroll_axis("x", args)
+
+    def _on_vscroll(self, *args):
+        self._scroll_axis("y", args)
+
+    def _scroll_axis(self, axis, args):
+        """Standard ttk.Scrollbar callback: args is either
+        ('moveto', fraction) from dragging the thumb, or
+        ('scroll', amount, 'units'|'pages') from clicking the arrows/trough."""
+        if self.zoom_mode != "manual" or self.full_shape is None:
+            return
+        fh, fw = self.full_shape
+        dim = fw if axis == "x" else fh
+        cw, ch = self.preview_canvas.winfo_width(), self.preview_canvas.winfo_height()
+        span_px = (cw if axis == "x" else ch) / self.zoom_pct
+        span_frac = min(1.0, span_px / dim)
+        cur = self.view_cx if axis == "x" else self.view_cy
+
+        if args[0] == "moveto":
+            new_center = float(args[1]) + span_frac / 2
+        elif args[0] == "scroll":
+            amount = float(args[1])
+            step = span_frac if args[2] == "pages" else span_frac * 0.05
+            new_center = cur + amount * step
+        else:
+            return
+
+        new_center = min(1.0, max(0.0, new_center))
+        if axis == "x":
+            self.view_cx = new_center
+        else:
+            self.view_cy = new_center
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    def _compute_crop(self, cw, ch):
+        """(x, y, w, h) in original-image pixels corresponding to what should
+        fill the canvas at the current zoom/pan level."""
+        fh, fw = self.full_shape
+        crop_w = max(1, min(fw, int(round(cw / self.zoom_pct))))
+        crop_h = max(1, min(fh, int(round(ch / self.zoom_pct))))
+        x = int(round(self.view_cx * fw - crop_w / 2))
+        y = int(round(self.view_cy * fh - crop_h / 2))
+        x = max(0, min(fw - crop_w, x))
+        y = max(0, min(fh - crop_h, y))
+        return x, y, crop_w, crop_h
+
+    def _raster_crop_view(self, cw, ch):
+        """Instant, local fallback for manual mode: crop/scale the low-res
+        raster around the current pan position, using the same framing a
+        real full-res crop would have. Blurrier than the real thing, but it
+        responds to drag/wheel/scrollbar immediately instead of waiting on a
+        round-trip to Siril."""
+        rh, rw = self._preview_rgb.shape[:2]
+        fh, fw = self.full_shape
+        scale_x, scale_y = rw / fw, rh / fh
+        crop_w = max(1, min(rw, int(round(cw / self.zoom_pct * scale_x))))
+        crop_h = max(1, min(rh, int(round(ch / self.zoom_pct * scale_y))))
+        x = int(round(self.view_cx * rw - crop_w / 2))
+        y = int(round(self.view_cy * rh - crop_h / 2))
+        x = max(0, min(rw - crop_w, x))
+        y = max(0, min(rh - crop_h, y))
+        crop = self._preview_rgb[y:y + crop_h, x:x + crop_w]
+        img = Image.fromarray((np.clip(crop, 0, 1) * 255).astype(np.uint8))
+        return img.resize((cw, ch), Image.NEAREST)
+
+    def _schedule_hires_fetch(self):
+        if self.full_shape is None or self._siril_busy:
+            return
+        if self._hires_after_id is not None:
+            self.root.after_cancel(self._hires_after_id)
+        self._hires_after_id = self.root.after(250, self._start_hires_fetch)
+
+    def _start_hires_fetch(self):
+        self._hires_after_id = None
+        if self._siril_busy:
+            return
+        cw = self.preview_canvas.winfo_width()
+        ch = self.preview_canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        crop = self._compute_crop(cw, ch)
+        self._hires_gen += 1
+        gen = self._hires_gen
+        vals = self._slider_values()
+        spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_params())
+        full = self._pristine_full
+        self._busy_begin()
+        t = threading.Thread(target=self._hires_fetch_thread,
+                              args=(gen, crop, vals, spike_state, full), daemon=True)
+        t.start()
+
+    def _hires_fetch_thread(self, gen, crop, vals, spike_state, full):
+        # Always post something, success or failure - see the matching note
+        # in _spike_preview_thread on why this can't just return on error.
+        rgb, actual_wh = None, None
+        try:
+            # The crop is sliced straight out of the pristine full-resolution
+            # array we already hold in memory - no round trip to Siril, and
+            # the returned size always matches the requested one exactly.
+            req_x, req_y, req_w, req_h = crop
+            rgb = full[req_y:req_y + req_h, req_x:req_x + req_w].copy()
+            got_h, got_w = rgb.shape[:2]
+
+            rgb = apply_cosmetics(rgb, *vals)
+            spike_enabled, stars, sparams = spike_state
+            if spike_enabled and stars:
+                layer = render_spike_layer((got_h, got_w), req_x, req_y, req_w, req_h,
+                                            stars, *sparams)
+                rgb = apply_spikes(rgb, layer)
+            actual_wh = (got_w, got_h)
+        except Exception as e:
+            # This is only a high-res preview: on failure we just stay on the
+            # local raster fallback instead of popping an error at the user.
+            rgb = None
+            try:
+                self.worker.log(f"frankSpikes: hi-res crop fetch failed: {e}")
+            except Exception:
+                pass
+        self.queue.put(("hires", (gen, rgb, actual_wh)))
+
+    def _original_crop_view(self, cw, ch):
+        """Same crop/zoom framing _redraw_canvas's manual-mode hires view
+        uses, but sliced straight from the untouched pristine full-res
+        source instead of the edited one - instant (no background fetch
+        needed, it's a plain slice) and used for the Space-bar 'before'
+        toggle so it lines up exactly with whatever's currently on screen."""
+        x, y, crop_w, crop_h = self._compute_crop(cw, ch)
+        crop = self._pristine_full[y:y + crop_h, x:x + crop_w]
+        disp_w = max(1, int(round(crop_w * self.zoom_pct)))
+        disp_h = max(1, int(round(crop_h * self.zoom_pct)))
+        img = Image.fromarray((np.clip(crop, 0, 1) * 255).astype(np.uint8))
+        return img.resize((disp_w, disp_h), Image.NEAREST if self.zoom_pct > 1.0 else Image.BILINEAR)
+
+    def _redraw_canvas(self):
+        canvas = self.preview_canvas
+        if self._preview_rgb is None:
+            return
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+
+        if self.zoom_mode == "fit":
+            source = self._src_preview_rgb if self._show_original else self._preview_rgb
+            h, w = source.shape[:2]
+            self.zoom_pct = min(cw / w, ch / h, 8.0)
+            # self.zoom_pct above is relative to this low-res preview raster
+            # (needed as-is for the resize/click-mapping math right below,
+            # and it must stay in lockstep with _canvas_to_full's fit
+            # branch) - but "100%" should mean the image's real native
+            # resolution, not the size of this internal downsampled raster,
+            # so the displayed label uses a separately-scaled value.
+            fh, fw = self.full_shape
+            self._display_zoom_pct = self.zoom_pct * (w / fw)
+            img = Image.fromarray((np.clip(source, 0, 1) * 255).astype(np.uint8))
+            # int(round(...)), not a bare int() truncation - _canvas_to_full
+            # must compute the exact same size or a Ctrl+Click's screen->
+            # full-res conversion drifts off whatever's actually on screen.
+            disp_w = max(1, int(round(w * self.zoom_pct)))
+            disp_h = max(1, int(round(h * self.zoom_pct)))
+            # LANCZOS instead of BILINEAR: this raster already carries real
+            # detail up to PREVIEW_MAX_W now, and BILINEAR was visibly
+            # softening it further on top of that when scaled to fill the
+            # canvas.
+            img = img.resize((disp_w, disp_h), Image.LANCZOS)
+            self._tkimg = ImageTk.PhotoImage(img)
+            canvas.delete("all")
+            canvas.create_image(cw // 2, ch // 2, image=self._tkimg, anchor="center")
+            self.hbar.set(0.0, 1.0)
+            self.vbar.set(0.0, 1.0)
+        else:
+            # Already native-resolution-relative here (100% really is 1
+            # screen pixel per real image pixel), unlike the fit branch.
+            self._display_zoom_pct = self.zoom_pct
+            if self._show_original:
+                img = self._original_crop_view(cw, ch)
+            elif self._hires_rgb is not None:
+                actual_w, actual_h = self._hires_wh
+                disp_w = max(1, int(round(actual_w * self.zoom_pct)))
+                disp_h = max(1, int(round(actual_h * self.zoom_pct)))
+                img = Image.fromarray((np.clip(self._hires_rgb, 0, 1) * 255).astype(np.uint8))
+                img = img.resize((disp_w, disp_h), Image.NEAREST if self.zoom_pct > 1.0 else Image.BILINEAR)
+            else:
+                img = self._raster_crop_view(cw, ch)
+            self._tkimg = ImageTk.PhotoImage(img)
+            canvas.delete("all")
+            canvas.create_image(cw // 2, ch // 2, image=self._tkimg, anchor="center")
+
+            x, y, crop_w, crop_h = self._compute_crop(cw, ch)
+            fh, fw = self.full_shape
+            self.hbar.set(x / fw, (x + crop_w) / fw)
+            self.vbar.set(y / fh, (y + crop_h) / fh)
+
+        self.zoom_label.set(f"{self._display_zoom_pct * 100:.0f}%")
+        self._redraw_navigator()
+
+    def _redraw_navigator(self):
+        """Small thumbnail of the whole image with a rectangle showing
+        what's currently visible in the main preview - a real navigator,
+        like Photoshop's. Click/drag inside it to pan the main view there."""
+        canvas = self.nav_canvas
+        if self._preview_rgb is None or self.full_shape is None:
+            return
+        ph, pw = self._preview_rgb.shape[:2]
+        scale = min(NAV_MAX_W / pw, NAV_MAX_H / ph)
+        thumb_w = max(1, int(round(pw * scale)))
+        thumb_h = max(1, int(round(ph * scale)))
+        img = Image.fromarray((np.clip(self._preview_rgb, 0, 1) * 255).astype(np.uint8))
+        img = img.resize((thumb_w, thumb_h), Image.BILINEAR)
+        self._nav_tkimg = ImageTk.PhotoImage(img)
+
+        ox = (NAV_MAX_W - thumb_w) // 2
+        oy = (NAV_MAX_H - thumb_h) // 2
+        self._nav_geom = (ox, oy, thumb_w, thumb_h)
+
+        canvas.delete("all")
+        canvas.create_image(ox, oy, image=self._nav_tkimg, anchor="nw")
+
+        # Viewport rectangle: same fractional [x0,x1] x [y0,y1] the main
+        # scrollbars are set to - full coverage in Fit mode (the whole
+        # image is visible), the current crop otherwise.
+        if self.zoom_mode == "fit":
+            fx0, fx1, fy0, fy1 = 0.0, 1.0, 0.0, 1.0
+        else:
+            cw = self.preview_canvas.winfo_width()
+            ch = self.preview_canvas.winfo_height()
+            if cw > 1 and ch > 1:
+                x, y, crop_w, crop_h = self._compute_crop(cw, ch)
+                fh, fw = self.full_shape
+                fx0, fx1 = x / fw, (x + crop_w) / fw
+                fy0, fy1 = y / fh, (y + crop_h) / fh
+            else:
+                fx0, fx1, fy0, fy1 = 0.0, 1.0, 0.0, 1.0
+
+        rx0, rx1 = ox + fx0 * thumb_w, ox + fx1 * thumb_w
+        ry0, ry1 = oy + fy0 * thumb_h, oy + fy1 * thumb_h
+        canvas.create_rectangle(rx0, ry0, rx1, ry1, outline=PALETTE["accent"], width=2)
+
+    def _on_nav_click(self, event):
+        if self._nav_geom is None or self.full_shape is None or not self.loaded:
+            return
+        ox, oy, thumb_w, thumb_h = self._nav_geom
+        fx = (event.x - ox) / max(1, thumb_w)
+        fy = (event.y - oy) / max(1, thumb_h)
+        fx = min(1.0, max(0.0, fx))
+        fy = min(1.0, max(0.0, fy))
+        self.view_cx, self.view_cy = fx, fy
+        if self.zoom_mode == "fit":
+            self.zoom_mode = "manual"
+        self._redraw_canvas()
+        self._schedule_hires_fetch()
+
+    # ---------- Process (full resolution, background thread) ----------
+    def _on_process(self):
+        self.btn_process.config(state="disabled")
+        self._busy_begin()
+        self._siril_busy = True
+        t = threading.Thread(target=self._process_thread, daemon=True)
+        t.start()
+
+    def _process_thread(self):
+        try:
+            vals = self._slider_values()
+            spike_enabled = self.spike_enabled.get()
+            stars = self._effective_stars()
+            sparams = self._spike_params()
+
+            if self._pristine_full is None:
+                raise RuntimeError("No image loaded from Siril yet.")
+
+            cur_shape = self.worker.get_shape()
+            if cur_shape != self.full_shape:
+                raise RuntimeError(
+                    "The image active in Siril has changed since this script started "
+                    f"(was {self.full_shape[1]}x{self.full_shape[0]}, now "
+                    f"{cur_shape[1]}x{cur_shape[0]}). Run the script again.")
+
+            self.queue.put(("status", "Process: applying adjustments..."))
+            rgb_final = apply_cosmetics(self._pristine_full, *vals)
+
+            if spike_enabled and stars:
+                self.queue.put(("status", "Process: rendering diffraction spikes..."))
+                fh, fw = self.full_shape
+                layer = render_spike_layer((fh, fw), 0, 0, fw, fh, stars, *sparams)
+                rgb_final = apply_spikes(rgb_final, layer)
+
+            self.queue.put(("status", "Process: applying to the active image in Siril..."))
+            self.worker.push_rgb(rgb_final)
+
+            self.queue.put(("status", "Done - applied to the active image in Siril. "
+                                       "Keep adjusting and Process again if you want."))
+            self.queue.put(("done", None))
+        except Exception as e:
+            self.queue.put(("error", format_error(e)))
+
+    # ---------- Thread -> UI event queue ----------
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                if kind == "status":
+                    self.status.set(payload)
+                elif kind == "loaded":
+                    (filename, self._pristine_full, self._src_preview_rgb,
+                     self.full_shape, self._stars) = payload
+                    self.active_filename.set(filename)
+                    self._spike_disabled = set()
+                    self._spike_forced = set()
+                    self._spike_manual = []
+                    self.loaded = True
+                    self._siril_busy = False
+                    self._hires_rgb = None
+                    self._hires_wh = None
+                    self.view_cx, self.view_cy = 0.5, 0.5
+                    self._busy_end()
+                    self.btn_process.config(state="normal")
+                    self._render_preview()
+                    self._schedule_spike_preview()
+                    if self.zoom_mode == "manual":
+                        self._schedule_hires_fetch()
+                elif kind == "hires":
+                    gen, rgb, actual_wh = payload
+                    self._busy_end()
+                    if rgb is not None and gen == self._hires_gen:
+                        self._hires_rgb = rgb
+                        self._hires_wh = actual_wh
+                        self._redraw_canvas()
+                elif kind == "spike_preview":
+                    gen, layer = payload
+                    self._busy_end()
+                    if layer is not None and gen == self._spike_preview_gen:
+                        self._spike_layer_preview = layer
+                        self._compose_preview()
+                        self._redraw_canvas()
+                elif kind == "done":
+                    self._busy_end()
+                    self._siril_busy = False
+                    self.btn_process.config(state="normal")
+                    # Stays open on purpose: each Process call pushes an
+                    # independent undo checkpoint in Siril (see push_rgb),
+                    # so if the result isn't liked, the user can keep
+                    # adjusting sliders and Process again as many times as
+                    # they want - always re-applied from the untouched
+                    # pristine source, never stacked on the previous result.
+                elif kind == "error":
+                    self._busy_end()
+                    self._siril_busy = False
+                    self.btn_process.config(state="normal")
+                    messagebox.showerror("Error", payload)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
+
+
+def _make_dpi_aware():
+    """On Windows, an app that doesn't declare DPI-awareness gets its
+    click coordinates reported by Tk in a *scaled* coordinate space that
+    doesn't line up 1:1 with real screen pixels whenever display scaling
+    isn't 100% (125%/150% are extremely common) - every geometry formula
+    in this script can be exactly right and a Ctrl+Click still lands off
+    the star it looks like you clicked on. Must be called before the Tk
+    root is created to take effect."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # per-process system DPI aware
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()  # older Windows fallback
+    except Exception:
+        pass
+
+
+def main():
+    _make_dpi_aware()
+    try:
+        worker = SirilWorker()
+    except SirilConnectionError as e:
+        print(f"Error connecting to Siril: {e}")
+        return
+
+    root = tk.Tk()
+    root.title(f"frankSpikes {APP_VERSION} — by Frank Sferlazza")
+    root.minsize(700, 500)
+    App(root, worker)
+    # Size to the window's actual required content (computed only once all
+    # widgets exist) rather than a fixed guess - a fixed guess is exactly
+    # what let the bottom-right status bar labels get clipped once the
+    # window had more content in it than when that guess was picked.
+    root.update_idletasks()
+    req_w = max(1500, root.winfo_reqwidth())
+    req_h = max(820, root.winfo_reqheight())
+    root.geometry(f"{req_w}x{req_h}")
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
