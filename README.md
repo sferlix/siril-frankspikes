@@ -4,8 +4,7 @@ A Python GUI script for [Siril](https://siril.org/) that adds light/tone/color
 adjustments and realistic diffraction spikes to a single astrophotography
 image, with a live full-resolution preview — right inside Siril.
 
-> 📷 *Screenshot coming soon — drop one in `docs/screenshot.png` and reference
-> it here once available.*
+![frankSpikes screenshot](docs/screenshot.webp)
 
 ## Features
 
