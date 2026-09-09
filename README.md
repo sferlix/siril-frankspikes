@@ -25,13 +25,12 @@ image, with a live full-resolution preview — right inside Siril.
 Realistic star spikes as produced by a reflector's secondary-mirror spider:
 
 - **4 or 6 rays** — 2-vane/refractor spider vs. 3-vane spider (e.g. most Newtonians)
-- **Min star diameter** — only stars at or above this size get spikes
-- **Spike length** — proportional to each star's own size
-- Brightness follows the star's own amplitude, with each spike taking on **its own star's real color** (sampled from the star's own core pixels) rather than a flat white glow
+- **Small / Medium / Large stars tabs** — each star's own diameter smoothly blends its look between three size anchors, so a field of countless faint pinpoints and a handful of bright giants can look as different as they do in a real photo, instead of every qualifying star getting an identical spike. Length, intensity, thickness, soft flare, ring flare, color fringing, rainbow and color saturation are all independently tunable per anchor. Stars smaller than the Small anchor's diameter get no spike at all (that anchor doubles as the minimum-diameter cutoff)
+- **Natural variation** — a small, deterministic per-star jitter on each spike's length and rotation (seeded by the star's own position) that breaks up the "stamped" look of many similar-size stars all rendering an identical spike
+- Brightness also follows the star's own amplitude on top of its size, with each spike taking on **its own star's real color** (sampled from the star's own core pixels) rather than a flat white glow
 - **Sharpness** — softens the whole effect for long focal lengths, where seeing/optics blur real diffraction spikes well beyond a pixel-crisp render
-- **Soft flare** and **Ring flare** — a soft round glow and a thin diffraction ring around each qualifying star
-- **Color hue / Color fringing / Rainbow intensity / Color saturation** — fine control over the spike's coloring, from physically-styled wavelength-dependent fringing to an artistic rainbow cycle
-- **Manual editing** — Ctrl+Click a star in the preview to remove/restore its spikes (or force one onto a star smaller than the minimum diameter), or Ctrl+Click empty space to add one manually, exactly where you click
+- **Color hue** — a global rotation of every spike's own star color
+- **Manual editing** — Ctrl+Click a star in the preview to remove/restore its spikes (or force one onto a star smaller than the Small anchor's diameter), or Ctrl+Click empty space to add one manually, exactly where you click
 
 ### Preview & workflow
 - Real full-resolution pan/zoom preview (Fit / 100% / +/-), with a **Navigator** thumbnail showing the current viewport
