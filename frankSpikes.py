@@ -96,7 +96,7 @@ from PIL import Image, ImageFilter, ImageTk
 import sirilpy as s
 from sirilpy import SirilConnectionError
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.1.1"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
