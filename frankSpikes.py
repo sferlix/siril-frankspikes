@@ -106,7 +106,11 @@ FACEBOOK_URL = "https://www.facebook.com/francesco.sferlazza"
 # display format). Drives both the tk.Var setup and the tabbed UI in a
 # loop, instead of ~30 hand-written blocks (one per param per anchor).
 SPIKE_ANCHOR_PARAM_DEFS = [
-    ("diam",       "Diameter anchor (px)",           1,   300, 1,   "{:.0f}"),
+    # "diam"'s (lo, hi) here are just a fallback shape - the actual slider
+    # range for each tab comes from SPIKE_ANCHOR_DIAM_RANGES below, since a
+    # "Small" star and a "Large" star warrant very different ranges (no
+    # real star's FWHM ever approaches this row's own numbers).
+    ("diam",       "Diameter anchor (px)",           1,   160, 1,   "{:.0f}"),
     ("length",     "Spike length (x star diameter)", 0.5, 12,  0.1, "{:.1f}x"),
     ("intensity",  "Intensity",                      0,   250, 5,   "{:.0f}"),
     ("thickness",  "Thickness",                      0.1, 6,   0.1, "{:.1f}"),
@@ -117,6 +121,12 @@ SPIKE_ANCHOR_PARAM_DEFS = [
     ("saturation", "Color saturation",                0,   100, 5,   "{:.0f}"),
 ]
 SPIKE_ANCHOR_TAB_LABELS = ("Small stars", "Medium stars", "Large stars")
+# Per-tab (lo, hi) px range for the Diameter anchor slider - tighter at the
+# small end (typical cutoff sizes) and capped at the large end to what
+# even a badly bloated/saturated star's FWHM realistically reaches; a
+# uniform 1-300 range on every tab made small, precise drags on "Small"
+# and "Medium" nearly impossible.
+SPIKE_ANCHOR_DIAM_RANGES = ((1, 40), (5, 90), (15, 160))
 
 # Single source of truth for the spike panel's defaults, used both to set
 # up the controls and by the "Defaults" button - one place to tune them.
@@ -1320,12 +1330,15 @@ class App:
         # so this stays one loop instead of ~30 hand-written slider calls. ----
         notebook = ttk.Notebook(frm_spikes)
         notebook.grid(row=11, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
-        for tab_label, anchor_vars in zip(SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors):
+        for tab_label, anchor_vars, diam_range in zip(
+                SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors, SPIKE_ANCHOR_DIAM_RANGES):
             tab = ttk.Frame(notebook, style="Card.TFrame")
             tab.grid_columnconfigure(0, minsize=200)
             notebook.add(tab, text=tab_label)
             r = 0
             for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
+                if key == "diam":
+                    lo, hi = diam_range
                 self._add_slider(tab, r, label, anchor_vars[key], anchor_vars[key + "_label"],
                                   lo, hi, step=step, on_change=self._on_spike_slider)
                 r += 2
