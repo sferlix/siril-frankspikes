@@ -69,6 +69,13 @@ Diffraction Spikes (panel to the right of the preview)
      its spikes (this also lets you force a spike onto a star smaller than
      the Small anchor's diameter), or Ctrl+Click empty space to add one
      manually.
+   - Shift+Click a star to select it for individual editing: a dashed
+     circle marks it, and the same sliders switch to that one star's own
+     look, completely overriding the Small/Medium/Large or Simple size-
+     based settings for it from then on. Shift+Click empty space, or the
+     panel's Deselect button, returns to editing the global settings;
+     "Reset this star to its size-based look" drops just that star's
+     override.
 
 Hold Space over the preview to see the original, untouched image at the
 same pan/zoom position - release to go back to the edited view.
@@ -105,7 +112,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import sirilpy as s
 from sirilpy import SirilConnectionError
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.0"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -141,6 +148,33 @@ SPIKE_ANCHOR_TAB_LABELS = ("Small stars", "Medium stars", "Large stars")
 # too big, which is why a 20px "minimum diameter" cutoff used to exclude
 # 98%+ of real stars in that field.
 SPIKE_ANCHOR_DIAM_RANGES = ((1, 15), (2, 30), (5, 60))
+# Small stars are supposed to look subtler than Large ones - that's the
+# whole point of size grading - so their well-tuned Intensity/Thickness/etc.
+# values naturally sit low. But every tab shared the same slider ceiling
+# (SPIKE_ANCHOR_PARAM_DEFS' "hi", e.g. Intensity 0-250), so a Small value
+# like 10 or 15 lived in the bottom ~5% of the slider's travel - clicking
+# anywhere on most of the track overshot it by a huge margin, making fine
+# adjustment nearly impossible. Each tab's sliders (for every key except
+# "diam", which already has its own per-tab SPIKE_ANCHOR_DIAM_RANGES) now
+# scale their ceiling down from the full defined (lo, hi) span by this
+# fraction (Small, Medium, Large) - Large keeps the full range unchanged
+# (scale 1.0, so its own hand-tuned defaults and anything a user dials in
+# still fit exactly as before), Small and Medium get a proportionally
+# tighter one so the same slider travel maps to a finer value increment.
+SPIKE_ANCHOR_LOOK_SCALE = (0.4, 0.7, 1.0)
+_SPIKE_ANCHOR_PARAM_FULL_RANGE = {k: (lo, hi) for k, _label, lo, hi, _step, _fmt in SPIKE_ANCHOR_PARAM_DEFS}
+
+
+def spike_anchor_slider_range(tab_index, key):
+    """(lo, hi) a given per-size tab's slider for `key` actually spans -
+    the same math _build_ui uses to construct the widgets, exposed so
+    other code (the Uniform -> Per-size seeding hand-off, the per-image
+    auto-calibration) can clamp values it sets into range instead of
+    silently exceeding what the slider can display."""
+    if key == "diam":
+        return SPIKE_ANCHOR_DIAM_RANGES[tab_index]
+    lo, hi = _SPIKE_ANCHOR_PARAM_FULL_RANGE[key]
+    return lo, lo + (hi - lo) * SPIKE_ANCHOR_LOOK_SCALE[tab_index]
 
 # Single source of truth for the spike panel's defaults, used both to set
 # up the controls and by the "Defaults" button - one place to tune them.
@@ -491,6 +525,38 @@ def _star_attr(st, *names, default=0.0):
     return default
 
 
+def _dedupe_stars(stars, min_sep=8.0):
+    """Drops near-duplicate (x, y, fwhm, amplitude) tuples that are within
+    `min_sep` px of one another - used to merge tiled findstar results,
+    where a star sitting near a tile boundary can get independently
+    detected by more than one adjacent tile. A spatial hash (bucket size =
+    min_sep) keeps this close to O(n) instead of an O(n^2) all-pairs scan,
+    which matters once tiling can produce thousands of stars."""
+    cell = max(1.0, min_sep)
+    buckets = {}
+    kept = []
+    min_sep2 = min_sep * min_sep
+    for star in stars:
+        x, y = star[0], star[1]
+        cx, cy = int(x // cell), int(y // cell)
+        is_dup = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for (ox, oy) in buckets.get((cx + dx, cy + dy), ()):
+                    if (ox - x) ** 2 + (oy - y) ** 2 < min_sep2:
+                        is_dup = True
+                        break
+                if is_dup:
+                    break
+            if is_dup:
+                break
+        if is_dup:
+            continue
+        kept.append(star)
+        buckets.setdefault((cx, cy), []).append((x, y))
+    return kept
+
+
 def refine_star_position(full_rgb, x, y, fwhm, max_shift_frac=0.3):
     """findstar's PSF-fit centroid can be pulled slightly off a star's true
     visual peak by nearby nebulosity or a neighbouring star, especially in
@@ -566,6 +632,141 @@ def sample_star_color(full_rgb, x, y, fwhm):
     col = candidates[mask].mean(axis=0)
     m = max(float(col.max()), 1e-4)
     return (float(col[0] / m), float(col[1] / m), float(col[2] / m))
+
+
+def _local_plateau_size(luma, x, y, peak, r=3, tol=0.995):
+    """How many pixels within radius `r` of (x,y) sit within `tol` of
+    `peak` - near 1 for a normal smooth PSF core (a several-pixel-sigma
+    star's profile already drops several percent one pixel off centre),
+    much larger for a clipped/saturated core (a real flat top). Confirmed
+    on real stacked data: a visibly saturated star had 10-12 such pixels in
+    a 3px radius; this is the signature used to tell the two apart, not
+    just "very bright" (which a normal, well-fit bright star also is)."""
+    h, w = luma.shape
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+    y0, y1 = max(0, yi - r), min(h, yi + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    patch = luma[y0:y1, x0:x1]
+    return int(np.sum(patch >= tol * peak))
+
+
+def _measure_bright_star_profile(luma, x, y, peak, r=25):
+    """Rough fwhm/amplitude estimate for a bright point source straight
+    from its pixel profile (detect_saturated_stars doesn't have a PSF fit
+    to read these from) - a radially-binned half-max crossing. Only needs
+    to be a representative size for this script's own size-dependent
+    rendering, not photometrically precise."""
+    h, w = luma.shape
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+    y0, y1 = max(0, yi - r), min(h, yi + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0, 0.0
+    patch = luma[y0:y1, x0:x1]
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    rad = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+    outer = patch[rad > r * 0.7]
+    bg = float(np.median(outer)) if outer.size else float(np.median(patch))
+    half = bg + max(peak - bg, 1e-6) / 2.0
+    half_r = float(r)
+    for radius in range(1, r):
+        ring = patch[(rad >= radius - 1) & (rad < radius)]
+        if ring.size and float(ring.mean()) < half:
+            half_r = float(radius)
+            break
+    fwhm = max(1.5, half_r * 2.0)
+    amplitude = max(1e-6, peak - bg)
+    return fwhm, amplitude
+
+
+def detect_saturated_stars(full_rgb, existing_stars, bright_floor=0.90,
+                            plateau_min=5, min_sep=15, max_raw_candidates=4000,
+                            max_candidates=1500, downsample_factor=3):
+    """Supplementary detection for very bright/saturated point sources that
+    Siril's own findstar can miss - confirmed (by inspecting real stacked
+    pixel data) to be because a clipped, flat-topped core fails a Gaussian/
+    Moffat PSF fit's quality checks, not because those stars are dim - they
+    are frequently the single brightest pixels in the whole image, findstar
+    just can't fit a clean profile to them. Deliberately narrow in scope -
+    only genuinely clipped/plateaued peaks (see _local_plateau_size) past
+    `bright_floor` - this is not a general-purpose star finder, just a
+    targeted patch for the one confirmed failure mode; findstar remains the
+    primary detector for everything else, including ordinary bright stars.
+
+    full_rgb: (H,W,3) float [0,1], the same raw-orientation array the
+    caller already has in hand - no extra Siril round-trip. existing_stars:
+    the (x,y,fwhm,amplitude) tuples already found by Siril, in the SAME
+    pixel/coordinate convention as full_rgb, used only to avoid re-adding a
+    star findstar already reported. Returns a list of new
+    (xpos, ypos, fwhm, amplitude) tuples in that same convention, meant to
+    be concatenated onto `existing_stars`."""
+    h, w = full_rgb.shape[:2]
+    luma = 0.299 * full_rgb[..., 0] + 0.587 * full_rgb[..., 1] + 0.114 * full_rgb[..., 2]
+
+    # The local-max search runs on a downsampled copy - PIL's MaxFilter has
+    # no separable fast path and measured ~18s at full 15px-window
+    # resolution on a 26-megapixel image, entirely dominating Reload time.
+    # A few saturated stars merging into one candidate at this coarser
+    # scale is fine: the non-max-suppression pass below already collapses
+    # near-duplicates, and every kept candidate is re-centred and measured
+    # on the FULL-resolution luma afterward, so this only trades a little
+    # positional slop for ~50x less work up front.
+    ds = max(1, int(downsample_factor))
+    img8_small = Image.fromarray((np.clip(luma, 0, 1) * 255).astype(np.uint8)) \
+        .resize((max(1, w // ds), max(1, h // ds)), Image.BOX)
+    small = np.asarray(img8_small)
+    maxed_small = np.asarray(img8_small.filter(ImageFilter.MaxFilter(5)))
+    bright_val = int(round(bright_floor * 255))
+    mask = (small == maxed_small) & (small >= bright_val)
+    ys_s, xs_s = np.nonzero(mask)
+    if ys_s.size == 0:
+        return []
+
+    # Re-centre each downsampled candidate on the true full-resolution peak
+    # within its cell (+/- half a downsampled pixel of slack either side).
+    r = ds + 1
+    ys, xs, peaks = [], [], []
+    for ysd, xsd in zip(ys_s, xs_s):
+        fy, fx = int(ysd * ds + ds // 2), int(xsd * ds + ds // 2)
+        y0, y1 = max(0, fy - r), min(h, fy + r + 1)
+        x0, x1 = max(0, fx - r), min(w, fx + r + 1)
+        patch = luma[y0:y1, x0:x1]
+        if patch.size == 0:
+            continue
+        py, px = np.unravel_index(np.argmax(patch), patch.shape)
+        ys.append(y0 + py)
+        xs.append(x0 + px)
+        peaks.append(float(patch[py, px]))
+    ys, xs, peaks = np.array(ys), np.array(xs), np.array(peaks)
+
+    order = np.argsort(-peaks)[:max_raw_candidates]
+    ys, xs, peaks = ys[order], xs[order], peaks[order]
+
+    ex_x = np.array([s[0] for s in existing_stars], dtype=np.float64)
+    ex_y = np.array([s[1] for s in existing_stars], dtype=np.float64)
+    min_sep2 = min_sep * min_sep
+
+    accepted = []  # (y, x, peak)
+    for y, x, peak in zip(ys, xs, peaks):
+        if ex_x.size and float(np.min((ex_x - x) ** 2 + (ex_y - y) ** 2)) < min_sep2:
+            continue
+        too_close = any((ay - y) ** 2 + (ax - x) ** 2 < min_sep2 for ay, ax, _ in accepted)
+        if too_close:
+            continue
+        if _local_plateau_size(luma, x, y, peak) < plateau_min:
+            continue
+        accepted.append((y, x, peak))
+        if len(accepted) >= max_candidates:
+            break
+
+    out = []
+    for y, x, peak in accepted:
+        fwhm, amplitude = _measure_bright_star_profile(luma, x, y, peak)
+        if fwhm > 0:
+            out.append((float(x), float(y), fwhm, amplitude))
+    return out
 
 
 def _rotate_hue(rgb, degrees):
@@ -821,10 +1022,15 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
     identically for the fit raster, a hi-res crop, and the final full-
     resolution render, so the effect has the same real-world size
     regardless of zoom. stars: list of (xpos, ypos, fwhm, amplitude, color,
-    forced) in full-resolution pixels - color is the star's own normalized
-    (r,g,b); forced=True bypasses the smallest anchor's diameter cutoff
-    (used for stars the user explicitly turned on with Ctrl+Click even
-    though they're smaller than that anchor).
+    forced, override) in full-resolution pixels - color is the star's own
+    normalized (r,g,b); forced=True bypasses the smallest anchor's diameter
+    cutoff (used for stars the user explicitly turned on with Ctrl+Click
+    even though they're smaller than that anchor); override, if not None,
+    is a dict of the 8 _ANCHOR_PARAM_KEYS set by Shift+Click-editing that
+    one star individually (see App._spike_star_overrides) - used exactly
+    as given instead of interpolating from cfg's anchors, and (like forced)
+    bypasses the diameter cutoff, since dialling in a custom look for a
+    star is itself a clear signal it should have a spike.
 
     cfg is a dict (see App._spike_config): "anchors" is the size-anchor
     dicts (each with "diam" plus the 8 keys in _ANCHOR_PARAM_KEYS) that get
@@ -839,7 +1045,9 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
 
     anchors_sorted = sorted(cfg["anchors"], key=lambda a: a["diam"])
     min_diameter = anchors_sorted[0]["diam"]
-    if (max(a["intensity"] for a in anchors_sorted) <= 0 and
+    has_overrides = any(ov is not None for (*_rest, ov) in stars)
+    if (not has_overrides and
+            max(a["intensity"] for a in anchors_sorted) <= 0 and
             max(a["soft_flare"] for a in anchors_sorted) <= 0 and
             max(a["ring_flare"] for a in anchors_sorted) <= 0):
         return layer
@@ -851,16 +1059,19 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
     jitter_amt = max(0.0, min(100.0, cfg.get("variation", 0.0))) / 100.0
 
     scale = out_w / float(view_w)
-    max_amp = max((a for (_, _, _, a, _c, _f) in stars), default=1.0) or 1.0
+    max_amp = max((a for (_, _, _, a, _c, _f, _o) in stars), default=1.0) or 1.0
 
-    for (x, y, fwhm, amp, color, forced) in stars:
-        if fwhm < min_diameter and not forced:
+    for (x, y, fwhm, amp, color, forced, override) in stars:
+        if override is not None:
+            p = override
+        elif fwhm < min_diameter and not forced:
             continue
-        # Forced stars smaller than the smallest anchor use that anchor's
-        # look exactly (clamped), never an extrapolation past it - only the
-        # actual ray/flare geometry below still scales with the star's real
-        # (smaller) fwhm, same as any other star.
-        p = _interp_anchor_params(anchors_sorted, max(fwhm, min_diameter))
+        else:
+            # Forced stars smaller than the smallest anchor use that
+            # anchor's look exactly (clamped), never an extrapolation past
+            # it - only the actual ray/flare geometry below still scales
+            # with the star's real (smaller) fwhm, same as any other star.
+            p = _interp_anchor_params(anchors_sorted, max(fwhm, min_diameter))
 
         margin = fwhm * max(p["length"], 6.0) + fwhm
         if not (view_x0 - margin <= x <= view_x0 + view_w + margin and
@@ -881,8 +1092,13 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
         angles = [rotation_deg + rot_jitter_deg + i * (360.0 / num_rays)
                   for i in range(num_rays)]
 
+        # Computed unconditionally (not just when intensity>0) because
+        # soft_flare/ring_flare below both reference it too, to keep their
+        # own size in proportion to however long the rays actually render -
+        # see the notes at each of those.
+        ray_len_px = fwhm * p["length"] * length_jitter * scale
+
         if p["intensity"] > 0:
-            ray_len_px = fwhm * p["length"] * length_jitter * scale
             if ray_len_px >= 1.5:
                 # No artificial minimum here: a 0.6px floor used to make
                 # thin spikes look reassuringly thick in the heavily
@@ -898,17 +1114,50 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
                                     star_color, p["chroma"], p["rainbow"], p["saturation"])
 
         if p["soft_flare"] > 0:
-            flare_radius_px = fwhm * 4.0 * scale
+            # A real stellar halo/bloom (scattered light, sensor blooming)
+            # is broader than the tight diffraction ring below and can
+            # bleed a little past the spikes' own tips, so this cap is
+            # generous rather than tight - it only kicks in for a
+            # dramatically short Length, not a normal one.
+            flare_radius_px = min(fwhm * 4.0 * scale,
+                                   max(ray_len_px * 1.2, fwhm * 2.0 * scale))
             if flare_radius_px >= 1.0:
                 flare_peak = (p["soft_flare"] / 100.0) * rel_amp * 0.8
                 _add_soft_flare(layer, cx, cy, flare_radius_px, flare_peak)
 
         if p["ring_flare"] > 0:
-            ring_radius_px = fwhm * 2.2 * scale
-            ring_width_px = max(0.8, fwhm * 0.35 * scale)
+            # A real diffraction ring comes from the aperture itself (a
+            # different mechanism than the support-vane spikes) and sits
+            # close to the star - on the order of its own FWHM, not the
+            # spike length. A radius fixed at fwhm alone looked fine next
+            # to a long spike but read as a separate ring floating well
+            # past a short one, so this caps it at a modest fraction of the
+            # actual rendered ray length too - while never shrinking below
+            # roughly the star's own size, since the ring exists even when
+            # spikes are short or disabled.
+            ring_radius_px = min(fwhm * 1.8 * scale,
+                                  max(ray_len_px * 0.6, fwhm * 1.0 * scale))
+            ring_width_px = max(0.8, fwhm * 0.3 * scale)
             if ring_radius_px >= 1.5:
                 ring_peak = (p["ring_flare"] / 100.0) * rel_amp * 0.7
                 _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, ring_peak)
+
+                # A real Airy pattern isn't one ring - successive bright
+                # rings sit at roughly 1.8x the radius of the one before
+                # (spacing of the Bessel-function zeros that bound each
+                # ring) and fade quickly, on the order of a quarter of the
+                # previous ring's peak. A single, suspiciously clean circle
+                # reads as synthetic; this second, fainter, wider one is
+                # what makes it read as a real multi-ring diffraction
+                # pattern instead - only drawn once the first ring is
+                # already visible, and capped against the same rendered
+                # ray length for the same reason as the first.
+                ring2_radius_px = min(ring_radius_px * 1.8,
+                                       max(ray_len_px * 0.9, fwhm * 1.4 * scale))
+                if ring2_radius_px >= 1.5:
+                    ring2_width_px = ring_width_px * 1.3
+                    ring2_peak = ring_peak * 0.25
+                    _add_ring_flare(layer, cx, cy, ring2_radius_px, ring2_width_px, ring2_peak)
 
     if sharpness < 100.0:
         # Expressed in full-res pixels then scaled, same convention as
@@ -969,17 +1218,15 @@ class SirilWorker:
         except Exception:
             return "(unnamed)"
 
-    def get_stars(self):
-        """Detected stars of the currently loaded image as a plain list of
-        (xpos, ypos, fwhm, amplitude) tuples in full-resolution pixels.
-        Calling findstar first (instead of relying on get_image_stars' own
-        automatic fallback) keeps detection using the same, predictable
-        default settings every time. Capped at 1000 (findstar returns the
-        most significant detections first) - a busy nebula field can
-        otherwise return tens of thousands, which is both slow to render
-        every time a slider moves and visually unreadable once that many
-        spikes overlap."""
-        self.cmd("findstar", "-maxstars=1000")
+    def _findstar_raw(self, maxstars=2000):
+        """One findstar + get_image_stars round-trip over whatever is
+        currently selected in Siril (the whole image if no selection is
+        active), returning plain (xpos, ypos, fwhm, amplitude) tuples in
+        full-resolution pixels, xpos/ypos in Siril's top-down display
+        convention. maxstars is hard-limited server-side to [100, 2000] -
+        a value outside that range doesn't get clamped, it fails the whole
+        findstar call (confirmed the hard way)."""
+        self.cmd("findstar", f"-maxstars={maxstars}")
         stars = self.siril.get_image_stars()
         out = []
         if stars:
@@ -992,11 +1239,93 @@ class SirilWorker:
                 amplitude = _star_attr(st, "amplitude", "A", default=1.0)
                 if fwhm > 0:
                     out.append((xpos, ypos, fwhm, max(1e-6, amplitude)))
-        # We already copied everything we need into plain Python tuples -
-        # clear Siril's own star list/overlay right away instead of leaving
-        # every detected star highlighted on the image for the whole session.
         self.clear_stars()
         return out
+
+    def get_stars(self):
+        """Detected stars of the currently loaded image as a plain list of
+        (xpos, ypos, fwhm, amplitude) tuples in full-resolution pixels.
+
+        maxstars is hard-limited by Siril itself to 2000 PER findstar CALL -
+        confirmed on a real 6248x4176 Milky Way field that this is nowhere
+        near enough: an independent pixel-level count found a whole region
+        of the frame with thousands of plausible stars and zero of Siril's
+        2000 landing in it (that region wasn't sparse - a denser cluster
+        elsewhere in the same frame most likely absorbed the whole global
+        budget). A single findstar call over the whole image structurally
+        cannot give even coverage on a field this rich, no matter how high
+        maxstars could go. So on a large image this tiles the frame into a
+        grid, selecting and running findstar on each tile separately (each
+        tile gets its own up-to-2000 budget) via boxselect, then merges and
+        deduplicates the results - real per-tile PSF fits, not a pixel-
+        heuristic guess. Falls back to a single whole-image call (the
+        original behavior) if boxselect turns out not to actually restrict
+        findstar in the caller's Siril version - verified by checking
+        whether the first tile's own results actually fall inside it."""
+        h, w = self.get_shape()
+        target = 1800  # px per tile side - keeps each tile's real star
+        # count comfortably under the 2000-per-call cap even on a very rich
+        # field, without needing dozens of slow Siril round-trips.
+        n_cols = max(1, round(w / target))
+        n_rows = max(1, round(h / target))
+        if n_cols * n_rows <= 1:
+            # Small/typical image - behave exactly as before, no selection
+            # juggling needed.
+            return self._findstar_raw()
+
+        tile_w = -(-w // n_cols)  # ceil
+        tile_h = -(-h // n_rows)
+        all_stars = []
+        tiling_ok = True
+        for row in range(n_rows):
+            for col in range(n_cols):
+                tx, ty = col * tile_w, row * tile_h
+                tw, th = min(tile_w, w - tx), min(tile_h, h - ty)
+                if tw <= 0 or th <= 0:
+                    continue
+                try:
+                    self.cmd("boxselect", str(tx), str(ty), str(tw), str(th))
+                    tile_stars = self._findstar_raw()
+                except Exception as e:
+                    self.log(f"frankSpikes: tiled findstar failed on tile "
+                              f"({tx},{ty},{tw}x{th}): {e} - falling back to "
+                              f"a single whole-image findstar call")
+                    tiling_ok = False
+                    break
+                if row == 0 and col == 0 and tile_stars:
+                    # Sanity check: if boxselect doesn't actually restrict
+                    # findstar in this Siril version, the "tile" results
+                    # would just be the whole image's stars again, mostly
+                    # landing outside this first (small) tile's bounds.
+                    margin = 5
+                    inside = sum(1 for (x, y, *_r) in tile_stars
+                                 if tx - margin <= x <= tx + tw + margin
+                                 and ty - margin <= y <= ty + th + margin)
+                    if inside / len(tile_stars) < 0.5:
+                        self.log(f"frankSpikes: boxselect doesn't appear to "
+                                  f"restrict findstar in this Siril version "
+                                  f"({inside}/{len(tile_stars)} results actually "
+                                  f"inside the first tile) - falling back to a "
+                                  f"single whole-image findstar call")
+                        tiling_ok = False
+                        break
+                all_stars.extend(tile_stars)
+            if not tiling_ok:
+                break
+
+        try:
+            self.cmd("boxselect", "-clear")
+        except Exception:
+            pass
+
+        if not tiling_ok:
+            return self._findstar_raw()
+
+        deduped = _dedupe_stars(all_stars)
+        self.log(f"frankSpikes: tiled findstar ({n_cols}x{n_rows} grid) found "
+                  f"{len(all_stars)} raw detections, {len(deduped)} after "
+                  f"deduplicating tile-boundary overlaps")
+        return deduped
 
     def clear_stars(self):
         """Clears the star markers findstar leaves drawn on the image."""
@@ -1118,7 +1447,35 @@ class App:
         self._stars = []
         self._spike_disabled = set()   # indices into self._stars excluded by the user
         self._spike_forced = set()     # indices into self._stars forced on past min diameter
-        self._spike_manual = []    # user-added (xpos, ypos, fwhm, amplitude, color)
+        # user-added (manual_id, xpos, ypos, fwhm, amplitude, color) - a
+        # stable manual_id (not list position) identifies each one, since
+        # Ctrl+Click deletion shifts list indices but must not silently
+        # reassign an unrelated star's per-star override (self._spike_star_overrides
+        # below) to whatever star happens to end up at the same index.
+        self._spike_manual = []
+        self._manual_id_counter = 0
+
+        # Per-star manual overrides: {("auto", i) | ("manual", manual_id):
+        # {each of _ANCHOR_PARAM_KEYS: value}} - set by dragging a slider
+        # while that star is selected (Shift+Click), see _on_star_slider_change.
+        # A star with an entry here ignores the Small/Medium/Large or Simple
+        # size-based look entirely and renders with exactly these 8 values
+        # (see render_spike_layer). Cleared on Reload and by "Reset manual
+        # edits", same lifecycle as _spike_disabled/_spike_forced/_spike_manual.
+        self._spike_star_overrides = {}
+        self._selected_star_key = None  # the ("auto"|"manual", id) currently
+        # selected for editing, or None - drives which slider panel shows
+        # (see _update_spike_mode_ui) and the dashed-circle highlight.
+
+        d_star = SPIKE_UNIFORM_DEFAULTS  # only used to seed the star-panel Vars' initial shape
+        self.spike_star = {}
+        for key, _label, _lo, _hi, _step, fmt in SPIKE_ANCHOR_PARAM_DEFS:
+            if key == "diam":
+                continue
+            val = d_star[key]
+            self.spike_star[key] = tk.DoubleVar(value=val)
+            self.spike_star[key + "_label"] = tk.StringVar(value=fmt.format(val))
+        self.spike_star_info = tk.StringVar(value="")
 
         self._pristine_full = None  # (H,W,3) float [0,1], fetched once from Siril
         self._src_preview_rgb = None  # raw (H,W,3) preview, before adjustments
@@ -1145,6 +1502,8 @@ class App:
         self._hires_wh = None
         self._hires_gen = 0
         self._hires_after_id = None
+        self._hires_inflight = False  # a hi-res fetch thread is currently running
+        self._spike_preview_inflight = False  # a spike-preview render thread is currently running
         self._siril_busy = False
         self._busy_count = 0  # how many background renders are in flight
         self._drag_last = None
@@ -1197,11 +1556,17 @@ class App:
         self._busy_count += 1
         if self._busy_count == 1:
             self.progress.start(12)
+            # "watch" is Tk's cross-platform busy-cursor name (the Windows
+            # hourglass/spinning-circle equivalent) - set on the root so it
+            # shows over every widget (sliders, canvas, buttons), not just
+            # wherever the mouse happens to already be.
+            self.root.config(cursor="watch")
 
     def _busy_end(self):
         self._busy_count = max(0, self._busy_count - 1)
         if self._busy_count == 0:
             self.progress.stop()
+            self.root.config(cursor="")
 
     # ---------- UI ----------
     def _make_scrollable_frame(self, parent):
@@ -1430,15 +1795,14 @@ class App:
         # so this stays one loop instead of ~30 hand-written slider calls. ----
         self._spike_notebook = ttk.Notebook(frm_spikes)
         self._spike_notebook.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
-        for tab_label, anchor_vars, diam_range in zip(
-                SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors, SPIKE_ANCHOR_DIAM_RANGES):
+        for tab_index, (tab_label, anchor_vars) in enumerate(
+                zip(SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors)):
             tab = ttk.Frame(self._spike_notebook, style="Card.TFrame")
             tab.grid_columnconfigure(0, minsize=200)
             self._spike_notebook.add(tab, text=tab_label)
             r = 0
-            for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
-                if key == "diam":
-                    lo, hi = diam_range
+            for key, label, _lo, _hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
+                lo, hi = spike_anchor_slider_range(tab_index, key)
                 self._add_slider(tab, r, label, anchor_vars[key], anchor_vars[key + "_label"],
                                   lo, hi, step=step, on_change=self._on_spike_slider)
                 r += 2
@@ -1462,6 +1826,30 @@ class App:
                               on_change=self._on_spike_slider)
             r += 2
 
+        # ---- Single-star editing: shown instead of the notebook/uniform
+        # panel above whenever a star is Shift+Click-selected - same 8
+        # sliders, but they read/write that one star's own override. ----
+        self._spike_star_frame = ttk.Frame(frm_spikes, style="Card.TFrame")
+        self._spike_star_frame.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_star_frame.grid_columnconfigure(0, minsize=200)
+        ttk.Label(self._spike_star_frame, textvariable=self.spike_star_info,
+                  style="Card.TLabel", justify="left", wraplength=210).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 4))
+        r = 2
+        for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
+            if key == "diam":
+                continue
+            self._add_slider(self._spike_star_frame, r, label, self.spike_star[key],
+                              self.spike_star[key + "_label"], lo, hi, step=step,
+                              on_change=self._on_star_slider_change)
+            r += 2
+        ttk.Button(self._spike_star_frame, text="Reset this star to its size-based look",
+                   style="Warn.TButton", command=self._reset_selected_star_override).grid(
+            row=r, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 2))
+        ttk.Button(self._spike_star_frame, text="Deselect", style="Toolbar.TButton",
+                   command=self._deselect_star).grid(
+            row=r + 1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
+
         self._spike_help_per_size = ("Each star's own diameter blends smoothly between the\n"
                        "Small/Medium/Large tabs above - stars below the Small\n"
                        "tab's diameter get no spike at all. Ctrl+Click a star in\n"
@@ -1476,6 +1864,10 @@ class App:
                        "star in the preview to remove/restore its spikes (or force\n"
                        "one below that diameter), or Ctrl+Click empty space to add\n"
                        "one. Judge Thickness at 100% zoom, not Fit.")
+        self._spike_help_star = ("These sliders set this one star's exact look, ignoring\n"
+                       "the Small/Medium/Large or Simple size-based settings\n"
+                       "entirely from now on. Shift+Click another star to switch,\n"
+                       "or empty space / Deselect to stop editing a single star.")
         self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
         self._spike_help_label.grid(
             row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
@@ -1593,26 +1985,65 @@ class App:
             full_shape = full_rgb.shape[:2]
             preview_rgb = downsample(full_rgb)
 
-            if stars:
-                # Confirmed empirically (not guessed - a user screenshot
-                # showed spikes for a bottom-of-frame star rendering at the
-                # top, a clean vertical mirror): get_image_stars()'s ypos
-                # is reported in top-down (display) convention, while
-                # get_image_pixeldata() - and so full_rgb here - is still
-                # in Siril's raw bottom-up FITS row order at this point.
-                # Convert to that same raw convention up front so refine/
-                # colour-sampling below (which read pixels straight out of
-                # full_rgb) use coordinates that actually land on the star;
-                # the single flip applied to image+stars together further
-                # down (raw -> display) then converts back, so the stored
-                # result ends up in display convention as it should.
-                # An earlier version tried to detect this per-image with a
-                # single star's single-pixel brightness test instead of
-                # applying it unconditionally - unreliable in a nebulous
-                # field, since both candidate rows can plausibly be bright.
-                fh, fw = full_shape
-                stars = [(x, fh - 1.0 - y, fw_, a) for (x, y, fw_, a) in stars]
+            # Confirmed empirically (not guessed - a user screenshot showed
+            # spikes for a bottom-of-frame star rendering at the top, a
+            # clean vertical mirror): get_image_stars()'s ypos is reported
+            # in top-down (display) convention, while get_image_pixeldata()
+            # - and so full_rgb here - is still in Siril's raw bottom-up
+            # FITS row order at this point. Convert to that same raw
+            # convention up front (unconditionally, not just when non-empty
+            # - detect_saturated_stars below needs it too) so refine/
+            # colour-sampling further down (which read pixels straight out
+            # of full_rgb) use coordinates that actually land on the star;
+            # the single flip applied to image+stars together further down
+            # (raw -> display) then converts back, so the stored result
+            # ends up in display convention as it should. An earlier
+            # version tried to detect this per-image with a single star's
+            # single-pixel brightness test instead of applying it
+            # unconditionally - unreliable in a nebulous field, since both
+            # candidate rows can plausibly be bright.
+            fh, fw = full_shape
+            stars = [(x, fh - 1.0 - y, fw_, a) for (x, y, fw_, a) in stars]
 
+            try:
+                extra = detect_saturated_stars(full_rgb, stars)
+            except Exception as e:
+                self.worker.log(f"frankSpikes: saturated-star supplement failed: {e}")
+                extra = []
+            if extra:
+                self.worker.log(
+                    f"frankSpikes: +{len(extra)} additional bright/saturated star(s) "
+                    f"found directly in the pixel data - findstar's PSF fit rejects a "
+                    f"clipped/flat-topped core, so these were missed regardless of the "
+                    f"Minimum diameter slider or the maxstars cap")
+                stars = stars + extra
+
+            # What "Small"/"Medium"/"Large" should mean is inherently
+            # image-dependent (a 6px star is huge for one setup, tiny for
+            # another oversampled/binned one) - fixed pixel defaults tuned
+            # on one reference image were always going to be wrong for a
+            # different field's actual star sizes. Calibrated instead from
+            # THIS field's own detected fwhm distribution: p5 (a size only
+            # the smallest ~5% of real stars fall under - just above the
+            # noise floor, not the single smallest outlier) for the cutoff/
+            # Small anchor, p50 (median - literally what a typical star
+            # here looks like) for Medium, p90 (clearly bigger/brighter
+            # than most, but not chasing one freak saturated outlier) for
+            # Large. Only the anchors' "diam" (where each look applies)
+            # gets set this way - the 8 look parameters (intensity, length,
+            # etc.) stay at their hand-tuned defaults, or whatever the user
+            # has already dialled in.
+            size_calibration = None
+            if stars:
+                fwhm_arr = np.array([s[2] for s in stars], dtype=np.float64)
+                p5, p50, p90 = np.percentile(fwhm_arr, [5, 50, 90])
+                size_calibration = {"small": float(p5), "medium": float(p50), "large": float(p90)}
+                self.worker.log(
+                    f"frankSpikes: calibrated star sizes for this image - "
+                    f"Small={p5:.1f}px (p5) Medium={p50:.1f}px (median) "
+                    f"Large={p90:.1f}px (p90)")
+
+            if stars:
                 # findstar's photometric centroid can be pulled slightly off
                 # the star's actual visual peak by nearby nebulosity or a
                 # neighbouring star - snap to the true local brightness peak
@@ -1652,7 +2083,8 @@ class App:
             if stars:
                 stars = [(x, fh - 1.0 - y, fw_, a, color) for (x, y, fw_, a, color) in stars]
 
-            self.queue.put(("loaded", (filename, full_rgb, preview_rgb, full_shape, stars)))
+            self.queue.put(("loaded", (filename, full_rgb, preview_rgb, full_shape, stars,
+                                        size_calibration)))
             self.queue.put(("status", "Ready. Adjust the sliders."))
         except Exception as e:
             self.queue.put(("error", format_error(e)))
@@ -1678,6 +2110,7 @@ class App:
                 av[key + "_label"].set(fmt.format(av[key].get()))
             if key != "diam":
                 self.spike_uniform[key + "_label"].set(fmt.format(self.spike_uniform[key].get()))
+                self.spike_star[key + "_label"].set(fmt.format(self.spike_star[key].get()))
 
     def _on_tone_slider(self):
         """Light & Tones / Color & Hue sliders: cheap, so recompute and
@@ -1757,31 +2190,39 @@ class App:
 
     def _effective_stars(self):
         """Detected stars minus any the user disabled, plus any manually
-        added ones - the exact (x,y,fwhm,amp,color,forced) list that goes
-        into rendering. `forced` bypasses the min-diameter cutoff: it's set
-        for stars the user explicitly turned on with Ctrl+Click even though
-        they're smaller than the current threshold, and always set for
-        manually-added ones (there's no "detected size" to filter by)."""
+        added ones - the exact (x,y,fwhm,amp,color,forced,override) list
+        that goes into rendering. `forced` bypasses the min-diameter
+        cutoff: it's set for stars the user explicitly turned on with
+        Ctrl+Click even though they're smaller than the current threshold,
+        and always set for manually-added ones (there's no "detected size"
+        to filter by). `override` is that star's manual per-star look (see
+        self._spike_star_overrides) if Shift+Click editing set one, else
+        None - render_spike_layer uses it verbatim instead of interpolating
+        from the Small/Medium/Large or Simple size-based anchors."""
         out = []
         for i, (x, y, fwhm, amp, color) in enumerate(self._stars):
             if i in self._spike_disabled:
                 continue
-            out.append((x, y, fwhm, amp, color, i in self._spike_forced))
-        for (x, y, fwhm, amp, color) in self._spike_manual:
-            out.append((x, y, fwhm, amp, color, True))
+            override = self._spike_star_overrides.get(("auto", i))
+            out.append((x, y, fwhm, amp, color, i in self._spike_forced, override))
+        for (mid, x, y, fwhm, amp, color) in self._spike_manual:
+            override = self._spike_star_overrides.get(("manual", mid))
+            out.append((x, y, fwhm, amp, color, True, override))
         return out
 
     def _reset_spike_edits(self):
         self._spike_disabled.clear()
         self._spike_forced.clear()
         self._spike_manual.clear()
+        self._spike_star_overrides.clear()
+        self._deselect_star()
         if self.loaded:
             self._schedule_spike_preview()
 
     def _reset_spike_defaults(self):
         """Resets the spike sliders to SPIKE_DEFAULTS - leaves per-star
-        Ctrl+Click edits (disabled/forced/manual stars) untouched, that's
-        what "Reset manual edits" is for."""
+        Ctrl+Click edits and Shift+Click overrides (disabled/forced/manual/
+        star_overrides) untouched, that's what "Reset manual edits" is for."""
         d = SPIKE_DEFAULTS
         self.spike_enabled.set(d["enabled"])
         self.spike_rays.set(d["rays"])
@@ -1811,38 +2252,167 @@ class App:
         self._update_spike_mode_ui()
         self._on_spike_slider()
 
+    def _apply_size_calibration(self, size_calibration):
+        """Sets the Small/Medium/Large tabs' and Uniform mode's diameter
+        sliders to what this specific image's own detected stars call for
+        (see _reload_thread's size_calibration comment for the p5/median/p90
+        reasoning) - runs once, right after Reload/star-detection finishes,
+        before the user has had any chance to touch a slider, so this never
+        overwrites a manual edit. Only repositions where each anchor's look
+        applies; the look itself (intensity, length, etc.) is untouched."""
+        small, medium, large = (size_calibration["small"], size_calibration["medium"],
+                                 size_calibration["large"])
+        u_lo, u_hi = SPIKE_ANCHOR_DIAM_RANGES[0]
+        self.spike_uniform_min_diam.set(min(u_hi, max(u_lo, small)))
+        for tab_index, (av, value) in enumerate(zip(self.spike_anchors, (small, medium, large))):
+            lo, hi = spike_anchor_slider_range(tab_index, "diam")
+            av["diam"].set(min(hi, max(lo, value)))
+        self._update_all_labels()
+
     def _seed_per_size_from_uniform(self):
         """One-time hand-off when switching Uniform -> Per size: sets the
-        Small/Medium/Large anchors to reproduce the exact look Uniform mode
-        was just rendering (sampled at the cutoff, the geometric-mean
-        midpoint, and the full-effect diameter), so the preview doesn't
-        jump and the three tabs become a starting point the user can then
-        diverge from ("make variations on their Per-size range") instead of
-        overwriting their own later per-size edits on every toggle back -
-        _on_spike_mode_change only calls this on the uniform->per_size
-        transition, not on every re-selection of "Per size"."""
+        Small/Medium/Large anchors to approximate the look Uniform mode was
+        just rendering, so the preview doesn't jump and the three tabs
+        become a starting point the user can then diverge from ("make
+        variations on their Per-size range") instead of overwriting their
+        own later per-size edits on every toggle back - _on_spike_mode_change
+        only calls this on the uniform->per_size transition, not on every
+        re-selection of "Per size".
+
+        Each tab's "diam" is set to its natural position on the Uniform
+        curve (the cutoff, the geometric-mean midpoint, and the full-effect
+        diameter). Its 8 look sliders are sampled from that same curve, but
+        NOT at those exact diameters for the Small tab: fwhm == the cutoff
+        is by construction the Uniform curve's zero-effect point (every
+        slider pinned to 0), so sampling Small's look there previously left
+        every slider in that tab at 0 - technically consistent with the
+        curve, but reads as broken rather than "a small star's subtler
+        look". Sampled a little past the cutoff instead, at 15% of the way
+        (in log-diameter space) toward the full-effect diameter, matching
+        how the original hand-tuned Small anchor default was never literally
+        zero either. Medium (already the curve's own midpoint) and Large
+        (already the curve's own full-effect point, non-degenerate) are
+        unaffected by this and still sample exactly on-curve."""
         anchors_sorted = sorted(self._uniform_anchors(), key=lambda a: a["diam"])
         lo_d, hi_d = anchors_sorted[0]["diam"], anchors_sorted[-1]["diam"]
         mid_d = (lo_d * hi_d) ** 0.5  # geometric mean - matches the log-diameter blend's midpoint
-        for av, diam_range, target_diam in zip(
-                self.spike_anchors, SPIKE_ANCHOR_DIAM_RANGES, (lo_d, mid_d, hi_d)):
-            av["diam"].set(min(diam_range[1], max(diam_range[0], target_diam)))
-            params = _interp_anchor_params(anchors_sorted, target_diam)
+        ratio = max(hi_d / max(lo_d, 1e-6), 1e-6)
+        small_sample_d = lo_d * (ratio ** 0.15)
+        for tab_index, (av, tab_diam, sample_d) in enumerate(zip(
+                self.spike_anchors, (lo_d, mid_d, hi_d), (small_sample_d, mid_d, hi_d))):
+            diam_lo, diam_hi = spike_anchor_slider_range(tab_index, "diam")
+            av["diam"].set(min(diam_hi, max(diam_lo, tab_diam)))
+            params = _interp_anchor_params(anchors_sorted, sample_d)
             for key in _ANCHOR_PARAM_KEYS:
-                av[key].set(params[key])
+                # Small/Medium's sliders have a narrower ceiling than the
+                # Uniform curve's own full-range params dict can produce
+                # (see SPIKE_ANCHOR_LOOK_SCALE) - clamp so the seeded value
+                # never silently exceeds what that tab's slider can show.
+                key_lo, key_hi = spike_anchor_slider_range(tab_index, key)
+                av[key].set(min(key_hi, max(key_lo, params[key])))
 
     def _update_spike_mode_ui(self):
         """Shows whichever of the notebook (per-size tabs) / flat uniform
-        panel matches the active mode, and swaps the matching help text -
-        only one of the two control sets is ever visible at once."""
-        if self.spike_mode.get() == "uniform":
+        panel / single-star panel applies right now, and swaps the matching
+        help text - only one of the three control sets is ever visible at
+        once. A star selection (Shift+Click) always wins over the Simple/
+        Per-size mode choice, which stays remembered underneath and
+        reappears as soon as the star is deselected."""
+        if self._selected_star_key is not None:
             self._spike_notebook.grid_remove()
+            self._spike_uniform_frame.grid_remove()
+            self._spike_star_frame.grid()
+            self._spike_help_label.config(text=self._spike_help_star)
+        elif self.spike_mode.get() == "uniform":
+            self._spike_notebook.grid_remove()
+            self._spike_star_frame.grid_remove()
             self._spike_uniform_frame.grid()
             self._spike_help_label.config(text=self._spike_help_uniform)
         else:
             self._spike_uniform_frame.grid_remove()
+            self._spike_star_frame.grid_remove()
             self._spike_notebook.grid()
             self._spike_help_label.config(text=self._spike_help_per_size)
+
+    def _current_look_for_fwhm(self, fwhm):
+        """The size-based (Simple or Per-size) look a star of this fwhm
+        currently renders with, absent any per-star override - used to
+        pre-fill the star-editing sliders with "what it looks like right
+        now" instead of some arbitrary default when a star is first
+        selected, so nudging a slider is a small change, not a jump."""
+        anchors = self._spike_config()["anchors"]
+        anchors_sorted = sorted(anchors, key=lambda a: a["diam"])
+        min_diameter = anchors_sorted[0]["diam"]
+        return _interp_anchor_params(anchors_sorted, max(fwhm, min_diameter))
+
+    def _star_lookup(self, key):
+        """(x, y, fwhm, amp, color) for a ("auto"|"manual", id) key, or
+        None if it no longer exists (e.g. a manual star that got deleted
+        while selected)."""
+        kind, ident = key
+        if kind == "auto":
+            if 0 <= ident < len(self._stars):
+                return self._stars[ident]
+            return None
+        for (mid, x, y, fwhm, amp, color) in self._spike_manual:
+            if mid == ident:
+                return (x, y, fwhm, amp, color)
+        return None
+
+    def _select_star(self, key):
+        """Selects a star for individual editing (Shift+Click): shows its
+        current look (its override if one exists, else the size-based look
+        it's currently rendering with) in the star-panel sliders, without
+        creating an override by itself - only actually moving a slider
+        does that (see _on_star_slider_change)."""
+        star = self._star_lookup(key)
+        if star is None:
+            return
+        _x, _y, fwhm, _amp, _color = star
+        self._selected_star_key = key
+        override = self._spike_star_overrides.get(key)
+        values = override if override is not None else self._current_look_for_fwhm(fwhm)
+        for k in _ANCHOR_PARAM_KEYS:
+            self.spike_star[k].set(values[k])
+        state = "custom look" if override is not None else "size-based look"
+        self.spike_star_info.set(f"Editing star (fwhm ≈ {fwhm:.1f}px) - showing its {state}")
+        self._update_all_labels()
+        self._update_spike_mode_ui()
+        self._redraw_canvas()
+
+    def _deselect_star(self):
+        if self._selected_star_key is None:
+            return
+        self._selected_star_key = None
+        self._update_spike_mode_ui()
+        self._redraw_canvas()
+
+    def _reset_selected_star_override(self):
+        """"Reset this star to its size-based look" - drops its override
+        (if any) and refreshes the sliders to show what it now falls back
+        to, without deselecting it."""
+        if self._selected_star_key is None:
+            return
+        had_override = self._spike_star_overrides.pop(self._selected_star_key, None) is not None
+        self._select_star(self._selected_star_key)
+        if had_override:
+            self._schedule_spike_preview()
+
+    def _on_star_slider_change(self):
+        """A star-panel slider moved: snapshot all 8 current values as that
+        star's override (the first touch turns "showing its current look"
+        into "now permanently overridden" - see _select_star/full-override
+        design), then re-render."""
+        self._update_all_labels()
+        if self._selected_star_key is None:
+            return
+        self._spike_star_overrides[self._selected_star_key] = {
+            k: self.spike_star[k].get() for k in _ANCHOR_PARAM_KEYS}
+        if not self.loaded:
+            return
+        self._schedule_spike_preview()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
 
     def _spike_supersample(self, ph, pw):
         """How much to render the spike layer oversized before area-
@@ -1895,6 +2465,18 @@ class App:
         self._spike_preview_after_id = None
         if not self.loaded or self._base_preview_rgb is None:
             return
+        if self._spike_preview_inflight:
+            # A previous render is still running - on a star-dense field
+            # one of these can take well over a second, far longer than
+            # the 150ms debounce, so without this guard a continuous drag
+            # launches many overlapping threads that all eventually finish
+            # one after another, keeping the busy spinner going for a
+            # while after the user has already stopped touching anything.
+            # Check back shortly instead of piling up another thread; once
+            # free, this always picks up whatever the sliders currently
+            # say, so nothing requested in the meantime gets lost.
+            self._spike_preview_after_id = self.root.after(50, self._start_spike_preview)
+            return
         self._spike_preview_gen += 1
         gen = self._spike_preview_gen
 
@@ -1915,6 +2497,7 @@ class App:
         fh, fw = self.full_shape
         params = self._spike_config()
         ss = self._spike_supersample(ph, pw)
+        self._spike_preview_inflight = True
         self._busy_begin()
         t = threading.Thread(target=self._spike_preview_thread,
                               args=(gen, ph, pw, fh, fw, stars, params, ss), daemon=True)
@@ -1977,13 +2560,17 @@ class App:
         self._redraw_canvas()
 
     def _on_canvas_press(self, event):
-        # Handled here (checking the Control bit directly) rather than via a
-        # separate <Control-Button-1> binding: on some Windows/Tk builds a
-        # plain <ButtonPress-1> binding on the same widget still fires
-        # alongside the modifier-qualified one, which made Ctrl+Click
-        # silently toggle a spike on and back off in the same click.
+        # Handled here (checking the modifier bits directly) rather than via
+        # separate <Control-Button-1>/<Shift-Button-1> bindings: on some
+        # Windows/Tk builds a plain <ButtonPress-1> binding on the same
+        # widget still fires alongside the modifier-qualified one, which
+        # made Ctrl+Click silently toggle a spike on and back off in the
+        # same click - so every modifier is read from this single handler.
         if event.state & 0x0004:  # Control key held
             self._on_canvas_ctrl_click(event)
+            return
+        if event.state & 0x0001:  # Shift key held
+            self._on_canvas_shift_click(event)
             return
         self._drag_last = (event.x, event.y)
 
@@ -2066,9 +2653,40 @@ class App:
             return None, None
         return x0 + ix * crop_w / actual_w, y0 + iy * crop_h / actual_h
 
+    def _full_to_canvas(self, fx, fy):
+        """Inverse of _canvas_to_full: full-resolution image pixel
+        coordinates -> screen coordinates on the preview canvas, using
+        whichever raster (fit or hi-res crop) is actually on screen right
+        now. Used only to position the selected-star highlight - unlike
+        _canvas_to_full, out-of-view results aren't filtered out here
+        (Tk simply won't draw an oval whose coordinates land off-canvas)."""
+        canvas = self.preview_canvas
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        fh, fw = self.full_shape
+
+        if self.zoom_mode == "fit":
+            ph, pw = self._preview_rgb.shape[:2]
+            disp_w = max(1, int(round(pw * self.zoom_pct)))
+            disp_h = max(1, int(round(ph * self.zoom_pct)))
+            ox, oy = cw / 2 - disp_w / 2, ch / 2 - disp_h / 2
+            ix, iy = fx * pw / fw, fy * ph / fh
+            return ix * self.zoom_pct + ox, iy * self.zoom_pct + oy
+
+        x0, y0, crop_w, crop_h = self._compute_crop(cw, ch)
+        actual_w, actual_h = self._hires_wh if self._hires_wh is not None else (crop_w, crop_h)
+        disp_w = max(1, int(round(actual_w * self.zoom_pct)))
+        disp_h = max(1, int(round(actual_h * self.zoom_pct)))
+        ox, oy = cw / 2 - disp_w / 2, ch / 2 - disp_h / 2
+        ix = (fx - x0) * actual_w / crop_w
+        iy = (fy - y0) * actual_h / crop_h
+        return ix * self.zoom_pct + ox, iy * self.zoom_pct + oy
+
     def _find_nearby_star(self, fx, fy):
         """Nearest detected or manually-added star within a small, fixed
-        hit radius of (fx, fy), as ("auto"|"manual", index), or None.
+        hit radius of (fx, fy), as ("auto", index) | ("manual", manual_id),
+        or None. The manual half is that star's stable id (see
+        self._spike_manual), not its current list position, so it stays
+        valid as a dict key even after some other manual star gets deleted.
 
         The radius used to be max(6px, the star's own fwhm) - fwhm is the
         star's optical size, not a sensible click tolerance, so a big
@@ -2085,11 +2703,24 @@ class App:
             d = ((x - fx) ** 2 + (y - fy) ** 2) ** 0.5
             if d <= HIT_RADIUS_PX and (best_d is None or d < best_d):
                 best, best_d = ("auto", i), d
-        for i, (x, y, _fwhm, _amp, _color) in enumerate(self._spike_manual):
+        for (mid, x, y, _fwhm, _amp, _color) in self._spike_manual:
             d = ((x - fx) ** 2 + (y - fy) ** 2) ** 0.5
             if d <= HIT_RADIUS_PX and (best_d is None or d < best_d):
-                best, best_d = ("manual", i), d
+                best, best_d = ("manual", mid), d
         return best
+
+    def _on_canvas_shift_click(self, event):
+        """Shift+Click: select a star for individual editing, or deselect
+        if the click didn't land on one (empty space, or outside the
+        displayed image) - see _select_star/_deselect_star."""
+        if not self.loaded or self.full_shape is None:
+            return
+        fx, fy = self._canvas_to_full(event.x, event.y)
+        hit = self._find_nearby_star(fx, fy) if fx is not None else None
+        if hit is not None:
+            self._select_star(hit)
+        else:
+            self._deselect_star()
 
     def _on_canvas_ctrl_click(self, event):
         if not self.loaded or self.full_shape is None:
@@ -2105,12 +2736,16 @@ class App:
         if hit is not None:
             kind, i = hit
             if kind == "manual":
-                hx, hy, hfwhm, _a, _c = self._spike_manual[i]
+                idx = next(idx for idx, m in enumerate(self._spike_manual) if m[0] == i)
+                _mid, hx, hy, hfwhm, _a, _c = self._spike_manual[idx]
                 self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) -> "
                                  f"full-res ({fx:.1f},{fy:.1f}) - removed MANUAL spike #{i} "
                                  f"at ({hx:.1f},{hy:.1f}) fwhm={hfwhm:.1f} "
                                  f"[distance from click: {((hx-fx)**2+(hy-fy)**2)**0.5:.1f}px]")
-                del self._spike_manual[i]
+                del self._spike_manual[idx]
+                self._spike_star_overrides.pop(("manual", i), None)
+                if self._selected_star_key == ("manual", i):
+                    self._deselect_star()
             else:
                 hx, hy, fwhm, _amp, _color = self._stars[i]
                 self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) -> "
@@ -2131,7 +2766,9 @@ class App:
                     self._spike_forced.add(i)
         else:
             default_fwhm = max(3.0, self._spike_min_diameter() * 1.5)
-            self._spike_manual.append((fx, fy, default_fwhm, 1.0, (1.0, 1.0, 1.0)))
+            self._manual_id_counter += 1
+            self._spike_manual.append(
+                (self._manual_id_counter, fx, fy, default_fwhm, 1.0, (1.0, 1.0, 1.0)))
             self.worker.log(f"frankSpikes: Ctrl+Click at screen ({event.x},{event.y}) "
                              f"canvas={cw}x{ch} zoom_mode={self.zoom_mode} "
                              f"zoom_pct={self.zoom_pct:.4f} -> full-res ({fx:.1f},{fy:.1f}) "
@@ -2218,6 +2855,14 @@ class App:
         self._hires_after_id = None
         if self._siril_busy:
             return
+        if self._hires_inflight:
+            # Same reasoning as _start_spike_preview's matching guard: a
+            # render-heavy crop on a star-dense field can take longer than
+            # the debounce window, so without this, continuous panning/
+            # zooming could launch overlapping fetch threads that keep the
+            # busy spinner going well after the user stops interacting.
+            self._hires_after_id = self.root.after(50, self._start_hires_fetch)
+            return
         cw = self.preview_canvas.winfo_width()
         ch = self.preview_canvas.winfo_height()
         if cw <= 1 or ch <= 1:
@@ -2228,6 +2873,7 @@ class App:
         vals = self._slider_values()
         spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_config())
         full = self._pristine_full
+        self._hires_inflight = True
         self._busy_begin()
         t = threading.Thread(target=self._hires_fetch_thread,
                               args=(gen, crop, vals, spike_state, full), daemon=True)
@@ -2335,7 +2981,25 @@ class App:
             self.vbar.set(y / fh, (y + crop_h) / fh)
 
         self.zoom_label.set(f"{self._display_zoom_pct * 100:.0f}%")
+        self._draw_selected_star_highlight()
         self._redraw_navigator()
+
+    def _draw_selected_star_highlight(self):
+        """Dashed circle around the Shift+Click-selected star, if any -
+        drawn as an extra canvas item on top of the image _redraw_canvas
+        just placed (canvas.delete("all") above already cleared any
+        previous one, so this only ever adds at most one)."""
+        if self._selected_star_key is None:
+            return
+        star = self._star_lookup(self._selected_star_key)
+        if star is None:
+            return
+        x, y, fwhm, _amp, _color = star
+        cx, cy = self._full_to_canvas(x, y)
+        r = max(10.0, fwhm * 1.5 * self._display_zoom_pct)
+        self.preview_canvas.create_oval(
+            cx - r, cy - r, cx + r, cy + r,
+            outline=PALETTE["accent_hover"], width=2, dash=(5, 3))
 
     def _redraw_navigator(self):
         """Small thumbnail of the whole image with a rectangle showing
@@ -2445,16 +3109,21 @@ class App:
                     self.status.set(payload)
                 elif kind == "loaded":
                     (filename, self._pristine_full, self._src_preview_rgb,
-                     self.full_shape, self._stars) = payload
+                     self.full_shape, self._stars, size_calibration) = payload
                     self.active_filename.set(filename)
                     self._spike_disabled = set()
                     self._spike_forced = set()
                     self._spike_manual = []
+                    self._manual_id_counter = 0
+                    self._spike_star_overrides = {}
+                    self._selected_star_key = None
                     self.loaded = True
                     self._siril_busy = False
                     self._hires_rgb = None
                     self._hires_wh = None
                     self.view_cx, self.view_cy = 0.5, 0.5
+                    if size_calibration is not None:
+                        self._apply_size_calibration(size_calibration)
                     self._busy_end()
                     self.btn_process.config(state="normal")
                     self._render_preview()
@@ -2463,6 +3132,7 @@ class App:
                         self._schedule_hires_fetch()
                 elif kind == "hires":
                     gen, rgb, actual_wh = payload
+                    self._hires_inflight = False
                     self._busy_end()
                     if rgb is not None and gen == self._hires_gen:
                         self._hires_rgb = rgb
@@ -2470,6 +3140,7 @@ class App:
                         self._redraw_canvas()
                 elif kind == "spike_preview":
                     gen, layer = payload
+                    self._spike_preview_inflight = False
                     self._busy_end()
                     if layer is not None and gen == self._spike_preview_gen:
                         self._spike_layer_preview = layer
