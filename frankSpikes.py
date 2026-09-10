@@ -26,15 +26,23 @@ Diffraction Spikes (panel to the right of the preview)
    - Realistic star spikes as produced by a reflector's secondary-mirror
      spider: 4 rays for a 2-vane (or refractor) spider, 6 rays for a 3-vane
      spider (e.g. most Newtonians).
-   - Small / Medium / Large stars tabs: each star's own diameter picks its
-     look by smoothly blending between these three size anchors (not a
-     hard cutoff between them) - length, intensity, thickness, soft flare,
-     ring flare, color fringing, rainbow and color saturation are all set
-     independently per anchor, so a field of countless faint pinpoints and
-     a handful of bright giants can look as different as they do in a real
-     photo instead of every qualifying star getting an identical spike.
-     Stars smaller than the Small anchor's diameter get no spike at all
-     (that anchor doubles as the old "minimum diameter" cutoff).
+   - Simple / Per size mode: two ways to control how a star's own diameter
+     shapes its spike (Simple is the default).
+     * Simple (one control for all stars): one flat slider set - no size
+       tabs to juggle. Every slider's real-world effect still scales with
+       each star's own size - essentially no effect right at the Minimum
+       star diameter, the full dialled-in value from about 4x that diameter
+       up - so a field of countless faint pinpoints and a handful of bright
+       giants still look as different as they do in a real photo, just from
+       one set of sliders. Stars smaller than the Minimum star diameter get
+       no spike at all.
+     * Per size (Small/Medium/Large tabs): each star's look blends smoothly
+       between three size anchors you tune independently (not a hard
+       cutoff) - length, intensity, thickness, soft flare, ring flare,
+       color fringing, rainbow and color saturation - for finer control
+       than Simple's one-knob-per-parameter scaling. Stars smaller than the
+       Small tab's own star size get no spike at all (that tab doubles as
+       the old "minimum diameter" cutoff).
    - Natural variation: a small, deterministic per-star jitter on each
      spike's length and rotation (seeded by the star's own position, so it
      never changes between re-renders) - breaks up the "stamped/CGI" look
@@ -83,6 +91,7 @@ HOW TO USE IT
 
 import os
 import sys
+import math
 import threading
 import queue
 import traceback
@@ -91,12 +100,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 import sirilpy as s
 from sirilpy import SirilConnectionError
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -110,31 +119,42 @@ SPIKE_ANCHOR_PARAM_DEFS = [
     # range for each tab comes from SPIKE_ANCHOR_DIAM_RANGES below, since a
     # "Small" star and a "Large" star warrant very different ranges (no
     # real star's FWHM ever approaches this row's own numbers).
-    ("diam",       "Diameter anchor (px)",           1,   160, 1,   "{:.0f}"),
-    ("length",     "Spike length (x star diameter)", 0.5, 12,  0.1, "{:.1f}x"),
-    ("intensity",  "Intensity",                      0,   250, 5,   "{:.0f}"),
-    ("thickness",  "Thickness",                      0.1, 6,   0.1, "{:.1f}"),
-    ("soft_flare", "Soft flare",                      0,   100, 5,   "{:.0f}"),
-    ("ring_flare", "Ring flare",                      0,   100, 5,   "{:.0f}"),
-    ("chroma",     "Color fringing (chromatic)",      0,   100, 5,   "{:.0f}"),
-    ("rainbow",    "Rainbow intensity",               0,   100, 5,   "{:.0f}"),
-    ("saturation", "Color saturation",                0,   100, 5,   "{:.0f}"),
+    ("diam",       "Star size this tab applies to (px)", 1,   160, 1,   "{:.0f}"),
+    ("length",     "Spike length (x star diameter)",     0.5, 12,  0.1, "{:.1f}x"),
+    ("intensity",  "Intensity",                          0,   250, 5,   "{:.0f}"),
+    ("thickness",  "Thickness",                          0.1, 6,   0.1, "{:.1f}"),
+    ("soft_flare", "Soft flare",                          0,   100, 5,   "{:.0f}"),
+    ("ring_flare", "Ring flare",                          0,   100, 5,   "{:.0f}"),
+    ("chroma",     "Color fringing (chromatic)",          0,   100, 5,   "{:.0f}"),
+    ("rainbow",    "Rainbow intensity",                   0,   100, 5,   "{:.0f}"),
+    ("saturation", "Color saturation",                    0,   100, 5,   "{:.0f}"),
 ]
 SPIKE_ANCHOR_TAB_LABELS = ("Small stars", "Medium stars", "Large stars")
 # Per-tab (lo, hi) px range for the Diameter anchor slider - tighter at the
-# small end (typical cutoff sizes) and capped at the large end to what
-# even a badly bloated/saturated star's FWHM realistically reaches; a
-# uniform 1-300 range on every tab made small, precise drags on "Small"
-# and "Medium" nearly impossible.
-SPIKE_ANCHOR_DIAM_RANGES = ((1, 40), (5, 90), (15, 160))
+# small end (typical cutoff sizes) and capped at the large end to what a
+# badly bloated/saturated star's FWHM realistically reaches; a uniform
+# 1-300 range on every tab made small, precise drags on "Small" and
+# "Medium" nearly impossible. Calibrated against a real field's detected
+# fwhm distribution (frankSpikes' own diagnostic Reload log): most stars
+# fall under ~10px, with a genuinely large/bright star around ~15-20px -
+# the original 1/5/15-40/90/160 ranges assumed FWHM values roughly 4-8x
+# too big, which is why a 20px "minimum diameter" cutoff used to exclude
+# 98%+ of real stars in that field.
+SPIKE_ANCHOR_DIAM_RANGES = ((1, 15), (2, 30), (5, 60))
 
 # Single source of truth for the spike panel's defaults, used both to set
 # up the controls and by the "Defaults" button - one place to tune them.
-# The "Medium" anchor reproduces frankSpikes 1.0's old fixed look exactly
-# (same numbers, previously the only size available) so existing users see
-# no change at that star size - only stars smaller or larger than it now
-# taper toward a subtler or a more dramatic look instead of getting an
-# identical spike regardless of size.
+# The "Medium" anchor's 8 look parameters reproduce frankSpikes 1.0's old
+# fixed look exactly (same numbers, previously the only size available) -
+# only stars smaller or larger than it taper toward a subtler or a more
+# dramatic look instead of getting an identical spike regardless of size.
+# The anchors' "diam" positions (where each look actually applies) were
+# originally guessed far too high - a real field's detected fwhm rarely
+# exceeds ~20px, so a "Large" anchor at 80px was essentially unreachable
+# and a 20px "Small"/minimum-diameter cutoff excluded ~98% of real stars
+# (confirmed via frankSpikes' own diagnostic Reload log on a real image:
+# fwhm min=2.0px median=6.8px, only 16/1000 stars above 20px). Repositioned
+# to 3/8/18px to actually span a typical field's stars.
 SPIKE_DEFAULTS = {
     "enabled": True,
     "rays": 4,
@@ -143,16 +163,37 @@ SPIKE_DEFAULTS = {
     "sharpness": 100.0,
     "variation": 15.0,
     "anchors": [
-        {"diam": 20.0, "length": 2.0, "intensity": 40.0, "thickness": 0.8,
+        {"diam": 3.0, "length": 2.0, "intensity": 40.0, "thickness": 0.8,
          "soft_flare": 0.0, "ring_flare": 0.0, "chroma": 0.0, "rainbow": 0.0,
          "saturation": 0.0},
-        {"diam": 40.0, "length": 4.0, "intensity": 110.0, "thickness": 1.1,
+        {"diam": 8.0, "length": 4.0, "intensity": 110.0, "thickness": 1.1,
          "soft_flare": 11.0, "ring_flare": 7.0, "chroma": 21.0, "rainbow": 21.0,
          "saturation": 0.0},
-        {"diam": 80.0, "length": 6.5, "intensity": 170.0, "thickness": 1.6,
+        {"diam": 18.0, "length": 6.5, "intensity": 170.0, "thickness": 1.6,
          "soft_flare": 35.0, "ring_flare": 20.0, "chroma": 45.0, "rainbow": 35.0,
          "saturation": 55.0},
     ],
+}
+
+# "Uniform" mode (single slider set for every star size, see spike_mode)
+# reuses the exact same anchor-interpolation code as the per-size anchors
+# above, fed two synthetic anchors instead of three: zero effect right at
+# "min_diam" (the cutoff, same role as the smallest per-size anchor's
+# diameter) and these literal slider values at SPIKE_UNIFORM_REF_MULT times
+# that diameter and beyond - so every parameter's real-world impact still
+# scales smoothly with each star's own size from a single knob per
+# parameter. Defaults tuned for a natural, photographic look (restrained
+# length/intensity, thin rays, only a slight star-colour tint, no rainbow,
+# minimal ring flare) rather than a flashy preset - only the handful of
+# genuinely bright stars in a field should show a clearly visible spike.
+# min_diam matches SPIKE_DEFAULTS' Small anchor - see that dict's comment
+# for why 20px (the original default) excluded ~98% of a real field's stars.
+SPIKE_UNIFORM_REF_MULT = 4.0
+SPIKE_UNIFORM_DEFAULTS = {
+    "min_diam": 3.0,
+    "length": 5.0, "intensity": 140.0, "thickness": 1.0,
+    "soft_flare": 15.0, "ring_flare": 5.0, "chroma": 15.0,
+    "rainbow": 0.0, "saturation": 25.0,
 }
 
 PALETTE = {
@@ -178,6 +219,29 @@ FONT_HEADER = ("Segoe UI", 15, "bold")
 FONT_SUBHEADER = ("Segoe UI", 9)
 FONT_CARD_TITLE = ("Segoe UI", 10, "bold")
 FONT_BADGE = ("Segoe UI", 8, "bold")
+
+
+def build_app_icon(size=64):
+    """A small diffraction-spike glyph (bright core + 8 tapered rays) used
+    as the window/taskbar icon - drawn in code rather than a bundled image
+    file, so the app stays a single script, and directly evokes what it
+    does instead of Tk's generic default feather icon."""
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    cx = cy = size / 2
+    core = (255, 255, 255, 255)
+    ray = (111, 149, 255, 255)  # PALETTE["accent_hover"]
+    for angle, length_frac, width in (
+        (0, 0.46, 3), (90, 0.46, 3), (180, 0.46, 3), (270, 0.46, 3),
+        (45, 0.24, 2), (135, 0.24, 2), (225, 0.24, 2), (315, 0.24, 2),
+    ):
+        rad = math.radians(angle)
+        x2 = cx + size * length_frac * math.cos(rad)
+        y2 = cy + size * length_frac * math.sin(rad)
+        draw.line([(cx, cy), (x2, y2)], fill=ray, width=width)
+    r = size * 0.09
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=core)
+    return img.filter(ImageFilter.GaussianBlur(0.6))
 
 
 def setup_style(root):
@@ -707,9 +771,11 @@ def _smoothstep(t):
 
 def _interp_anchor_params(anchors_sorted, fwhm):
     """Blend the 8 size-dependent spike parameters for a star of diameter
-    `fwhm`, from `anchors_sorted` (the 3 size-anchor dicts, sorted by their
-    own "diam", so the user is free to type Small > Medium in the UI
-    without the interpolation breaking). Diameter space is logarithmic -
+    `fwhm`, from `anchors_sorted` (2 or more size-anchor dicts - 3 for the
+    Small/Medium/Large per-size tabs, 2 synthetic ones for Uniform mode's
+    single slider set - sorted by their own "diam", so the user is free to
+    type Small > Medium in the UI without the interpolation breaking).
+    Diameter space is logarithmic -
     star sizes in a typical field cluster heavily near the small end, so
     linear spacing would put nearly every star right on top of the first
     anchor and make "Large" almost unreachable - and the blend itself eases
@@ -760,7 +826,7 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
     (used for stars the user explicitly turned on with Ctrl+Click even
     though they're smaller than that anchor).
 
-    cfg is a dict (see App._spike_config): "anchors" is the 3 size-anchor
+    cfg is a dict (see App._spike_config): "anchors" is the size-anchor
     dicts (each with "diam" plus the 8 keys in _ANCHOR_PARAM_KEYS) that get
     interpolated per star by _interp_anchor_params; "rays", "rotation",
     "hue" and "sharpness" (0-100, default 100 = untouched - softens the
@@ -1025,6 +1091,27 @@ class App:
                 av[key] = tk.DoubleVar(value=val)
                 av[key + "_label"] = tk.StringVar(value=fmt.format(val))
             self.spike_anchors.append(av)
+
+        # "Uniform" mode (shown to the user as "Simple"): one flat slider
+        # set (no size tabs) - see SPIKE_UNIFORM_DEFAULTS and
+        # _uniform_anchors(). "per_size" is the long-standing tabbed
+        # Small/Medium/Large behavior. Uniform/Simple is the default - the
+        # easier control for most users; Per size is the opt-in advanced one.
+        self.spike_mode = tk.StringVar(value="uniform")
+        self._last_spike_mode = "uniform"  # tracks the previous mode, so a
+        # switch INTO "per_size" FROM "uniform" is only seeded once (see
+        # _on_spike_mode_change) rather than clobbering hand-tuned per-size
+        # anchors on every later toggle back to "Per size".
+        ud = SPIKE_UNIFORM_DEFAULTS
+        self.spike_uniform_min_diam = tk.DoubleVar(value=ud["min_diam"])
+        self.spike_uniform_min_diam_label = tk.StringVar(value=f"{ud['min_diam']:.0f}")
+        self.spike_uniform = {}
+        for key, _label, _lo, _hi, _step, fmt in SPIKE_ANCHOR_PARAM_DEFS:
+            if key == "diam":
+                continue
+            val = ud[key]
+            self.spike_uniform[key] = tk.DoubleVar(value=val)
+            self.spike_uniform[key + "_label"] = tk.StringVar(value=fmt.format(val))
 
         # Detected stars as (xpos, ypos, fwhm, amplitude, color), full-res px;
         # color is the star's own normalized (r,g,b), see sample_star_color().
@@ -1291,7 +1378,7 @@ class App:
 
         # ---- Diffraction spikes panel: right of the image, not stacked
         # under A)/B) on the left, so the window doesn't grow very tall. ----
-        frm_spikes_outer = ttk.LabelFrame(frm_main, text="Diffraction Spikes")
+        frm_spikes_outer = ttk.LabelFrame(frm_main, text="✨ Diffraction Spikes")
         frm_spikes_outer.grid(row=0, column=3, rowspan=3, sticky="nsew", padx=(8, 0))
         frm_spikes_outer.grid_rowconfigure(0, weight=1)
         frm_spikes_outer.grid_columnconfigure(0, weight=1)
@@ -1303,38 +1390,51 @@ class App:
                          command=self._on_spike_slider).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4))
 
+        # ---- Mode: one flat slider set for every star (internal value
+        # "uniform", shown to the user as "Simple") vs the tabbed
+        # Small/Medium/Large controls below ("Per size"). Switching just
+        # swaps which panel is shown - each keeps its own values. ----
+        mode_box = ttk.Frame(frm_spikes, style="Card.TFrame")
+        mode_box.grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+        ttk.Radiobutton(mode_box, text="Simple (one control for all stars)",
+                         value="uniform", variable=self.spike_mode,
+                         command=self._on_spike_mode_change).pack(anchor="w")
+        ttk.Radiobutton(mode_box, text="Per size (separate Small/Medium/Large tabs)",
+                         value="per_size", variable=self.spike_mode,
+                         command=self._on_spike_mode_change).pack(anchor="w")
+
         ttk.Label(frm_spikes, text="Number of rays", style="Card.TLabel").grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 0))
+            row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 0))
         rays_box = ttk.Frame(frm_spikes, style="Card.TFrame")
-        rays_box.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
+        rays_box.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
         ttk.Radiobutton(rays_box, text="4 (refractor / 2-vane spider)", value=4,
                          variable=self.spike_rays, command=self._on_spike_slider).pack(anchor="w")
         ttk.Radiobutton(rays_box, text="6 (3-vane spider, e.g. Newtonian)", value=6,
                          variable=self.spike_rays, command=self._on_spike_slider).pack(anchor="w")
 
-        self._add_slider(frm_spikes, 3, "Rotation angle (0-90 deg)",
+        self._add_slider(frm_spikes, 4, "Rotation angle (0-90 deg)",
                           self.spike_rotation, self.spike_rotation_label, 0, 90,
                           step=1, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 5, "Color hue (each spike keeps its star's colour)",
+        self._add_slider(frm_spikes, 6, "Color hue (each spike keeps its star's colour)",
                           self.spike_hue, self.spike_hue_label, -180, 180,
                           step=5, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 7, "Sharpness (lower = softer, for long focal lengths)",
+        self._add_slider(frm_spikes, 8, "Sharpness (lower = softer, for long focal lengths)",
                           self.spike_sharpness, self.spike_sharpness_label, 0, 100,
                           step=5, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 9, "Natural variation (per-star jitter)",
+        self._add_slider(frm_spikes, 10, "Natural variation (per-star jitter)",
                           self.spike_variation, self.spike_variation_label, 0, 100,
                           step=5, on_change=self._on_spike_slider)
 
         # ---- Per-size-anchor look: a tab per anchor, each with the full
         # set of size-dependent controls, generated from SPIKE_ANCHOR_PARAM_DEFS
         # so this stays one loop instead of ~30 hand-written slider calls. ----
-        notebook = ttk.Notebook(frm_spikes)
-        notebook.grid(row=11, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_notebook = ttk.Notebook(frm_spikes)
+        self._spike_notebook.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
         for tab_label, anchor_vars, diam_range in zip(
                 SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors, SPIKE_ANCHOR_DIAM_RANGES):
-            tab = ttk.Frame(notebook, style="Card.TFrame")
+            tab = ttk.Frame(self._spike_notebook, style="Card.TFrame")
             tab.grid_columnconfigure(0, minsize=200)
-            notebook.add(tab, text=tab_label)
+            self._spike_notebook.add(tab, text=tab_label)
             r = 0
             for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
                 if key == "diam":
@@ -1343,21 +1443,49 @@ class App:
                                   lo, hi, step=step, on_change=self._on_spike_slider)
                 r += 2
 
-        ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left",
-                  text="Each star's own diameter blends smoothly between the\n"
+        # ---- Uniform look: the same 8 size-dependent controls as one tab
+        # would have, plus the cutoff diameter, gridded in the same cell as
+        # the notebook above - only one of the two is ever shown. ----
+        self._spike_uniform_frame = ttk.Frame(frm_spikes, style="Card.TFrame")
+        self._spike_uniform_frame.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_uniform_frame.grid_columnconfigure(0, minsize=200)
+        u_lo, u_hi = SPIKE_ANCHOR_DIAM_RANGES[0]
+        self._add_slider(self._spike_uniform_frame, 0, "Minimum star diameter (px)",
+                          self.spike_uniform_min_diam, self.spike_uniform_min_diam_label,
+                          u_lo, u_hi, step=1, on_change=self._on_spike_slider)
+        r = 2
+        for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
+            if key == "diam":
+                continue
+            self._add_slider(self._spike_uniform_frame, r, label, self.spike_uniform[key],
+                              self.spike_uniform[key + "_label"], lo, hi, step=step,
+                              on_change=self._on_spike_slider)
+            r += 2
+
+        self._spike_help_per_size = ("Each star's own diameter blends smoothly between the\n"
                        "Small/Medium/Large tabs above - stars below the Small\n"
                        "tab's diameter get no spike at all. Ctrl+Click a star in\n"
                        "the preview to remove/restore its spikes (or force one\n"
                        "below that diameter), or Ctrl+Click empty space to add\n"
                        "one. Judge Thickness at 100% zoom, not Fit - thin spikes\n"
-                       "can vanish into a few pixels once downsampled.").grid(
-            row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+                       "can vanish into a few pixels once downsampled.")
+        self._spike_help_uniform = ("Every slider's effect grows smoothly with each star's\n"
+                       "own size: essentially none right at the Minimum diameter,\n"
+                       "the full dialled-in value from about 4x that diameter up.\n"
+                       "Stars below the minimum get no spike at all. Ctrl+Click a\n"
+                       "star in the preview to remove/restore its spikes (or force\n"
+                       "one below that diameter), or Ctrl+Click empty space to add\n"
+                       "one. Judge Thickness at 100% zoom, not Fit.")
+        self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
+        self._spike_help_label.grid(
+            row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
         ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
                    command=self._reset_spike_edits).grid(
-            row=13, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+            row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
         ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
                    command=self._reset_spike_defaults).grid(
-            row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+            row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+        self._update_spike_mode_ui()
 
         # ---- Status bar ----
         frm_status = ttk.Frame(self.root, style="Card.TFrame")
@@ -1390,7 +1518,7 @@ class App:
 
     def _add_slider(self, parent, row, label, var, label_var, lo, hi, step=1.0, on_change=None):
         ttk.Label(parent, text=label, style="Card.TLabel").grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 0))
+            row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 0))
         cmd = on_change or self._on_tone_slider
         ttk.Scale(parent, from_=lo, to=hi, variable=var,
                   command=lambda _e: cmd()).grid(
@@ -1434,9 +1562,28 @@ class App:
             self.queue.put(("status", "Detecting stars for diffraction spikes..."))
             try:
                 stars = self.worker.get_stars()
-                self.worker.log(f"frankSpikes: {len(stars)} stars detected"
-                                 + (f", brightest fwhm={max(s[2] for s in stars):.1f}px"
-                                    if stars else ""))
+                if stars:
+                    fwhms = sorted(s[2] for s in stars)
+                    n = len(fwhms)
+                    median_fwhm = fwhms[n // 2]
+                    # Diagnostic for "many stars aren't getting spikes": the
+                    # Minimum star diameter slider (default 20px) filters out
+                    # any star whose own detected fwhm is below it - if most
+                    # of this field's stars sit well under that, the cutoff
+                    # itself, not detection, is why they're excluded. Logged
+                    # unconditionally (not just on request) since this is
+                    # exactly the number needed to tell the two apart, and
+                    # it's cheap to compute.
+                    below = {t: sum(1 for f in fwhms if f < t) for t in (5, 10, 20, 40)}
+                    self.worker.log(
+                        f"frankSpikes: {n} stars detected - fwhm min={fwhms[0]:.1f}px "
+                        f"median={median_fwhm:.1f}px max={fwhms[-1]:.1f}px "
+                        f"(below 5px: {below[5]}, below 10px: {below[10]}, "
+                        f"below 20px: {below[20]}, below 40px: {below[40]}) - stars "
+                        f"below the spike panel's Minimum diameter slider get no "
+                        f"spike at all")
+                else:
+                    self.worker.log("frankSpikes: 0 stars detected")
             except Exception as e:
                 self.worker.log(f"frankSpikes: star detection failed, spikes disabled: {e}")
                 stars = []
@@ -1525,9 +1672,12 @@ class App:
         self.spike_sharpness_label.set(f"{self.spike_sharpness.get():.0f}")
         self.spike_hue_label.set(f"{self.spike_hue.get():.0f}")
         self.spike_variation_label.set(f"{self.spike_variation.get():.0f}")
+        self.spike_uniform_min_diam_label.set(f"{self.spike_uniform_min_diam.get():.0f}")
         for key, _label, _lo, _hi, _step, fmt in SPIKE_ANCHOR_PARAM_DEFS:
             for av in self.spike_anchors:
                 av[key + "_label"].set(fmt.format(av[key].get()))
+            if key != "diam":
+                self.spike_uniform[key + "_label"].set(fmt.format(self.spike_uniform[key].get()))
 
     def _on_tone_slider(self):
         """Light & Tones / Color & Hue sliders: cheap, so recompute and
@@ -1561,11 +1711,16 @@ class App:
                 self.clarity.get(), self.vibrance.get(), self.saturation.get())
 
     def _spike_config(self):
-        """The single config object render_spike_layer takes: the 3
-        size-anchor dicts (current slider values, any order - the renderer
-        sorts them) plus the global (non-size-dependent) controls."""
-        anchors = [{key: av[key].get() for key, *_ in SPIKE_ANCHOR_PARAM_DEFS}
-                   for av in self.spike_anchors]
+        """The single config object render_spike_layer takes: the size-
+        anchor dicts (current slider values, any order - the renderer sorts
+        them) plus the global (non-size-dependent) controls. "anchors" comes
+        from whichever mode is active - _uniform_anchors() in "uniform" mode,
+        the 3 tabbed anchors in "per_size" mode."""
+        if self.spike_mode.get() == "uniform":
+            anchors = self._uniform_anchors()
+        else:
+            anchors = [{key: av[key].get() for key, *_ in SPIKE_ANCHOR_PARAM_DEFS}
+                       for av in self.spike_anchors]
         return {
             "anchors": anchors,
             "rays": int(self.spike_rays.get()),
@@ -1575,9 +1730,29 @@ class App:
             "variation": self.spike_variation.get(),
         }
 
+    def _uniform_anchors(self):
+        """Two synthetic anchors that let "Uniform" mode reuse the exact
+        same log-diameter/smoothstep blend as the per-size anchors (see
+        _interp_anchor_params): zero effect right at the Minimum diameter
+        (matching "no spike below cutoff", same as the smallest per-size
+        anchor), the literal dialled-in slider values at
+        SPIKE_UNIFORM_REF_MULT times that diameter and beyond - so every
+        parameter's real impact scales with each star's own size from a
+        single knob per parameter, with no separate interpolation path to
+        maintain."""
+        min_d = self.spike_uniform_min_diam.get()
+        full = {k: self.spike_uniform[k].get() for k in _ANCHOR_PARAM_KEYS}
+        zero = {k: 0.0 for k in _ANCHOR_PARAM_KEYS}
+        return [
+            {"diam": min_d, **zero},
+            {"diam": min_d * SPIKE_UNIFORM_REF_MULT, **full},
+        ]
+
     def _spike_min_diameter(self):
-        """The smallest size-anchor's diameter - doubles as the cutoff
-        below which a star gets no spike at all (see render_spike_layer)."""
+        """The current mode's cutoff diameter - below it a star gets no
+        spike at all (see render_spike_layer)."""
+        if self.spike_mode.get() == "uniform":
+            return self.spike_uniform_min_diam.get()
         return min(av["diam"].get() for av in self.spike_anchors)
 
     def _effective_stars(self):
@@ -1617,7 +1792,57 @@ class App:
         for av, defaults in zip(self.spike_anchors, d["anchors"]):
             for key, *_ in SPIKE_ANCHOR_PARAM_DEFS:
                 av[key].set(defaults[key])
+        ud = SPIKE_UNIFORM_DEFAULTS
+        self.spike_uniform_min_diam.set(ud["min_diam"])
+        for key in _ANCHOR_PARAM_KEYS:
+            self.spike_uniform[key].set(ud[key])
         self._on_spike_slider()
+
+    def _on_spike_mode_change(self):
+        new_mode = self.spike_mode.get()
+        if new_mode == "per_size" and self._last_spike_mode == "uniform":
+            # Carry the Uniform look over onto Small/Medium/Large instead of
+            # leaving the per-size tabs at whatever (possibly stale/default)
+            # values they last held - switching modes would otherwise feel
+            # like a reset, and any earlier Ctrl+Click star edits are
+            # untouched either way (only the sliders below are seeded).
+            self._seed_per_size_from_uniform()
+        self._last_spike_mode = new_mode
+        self._update_spike_mode_ui()
+        self._on_spike_slider()
+
+    def _seed_per_size_from_uniform(self):
+        """One-time hand-off when switching Uniform -> Per size: sets the
+        Small/Medium/Large anchors to reproduce the exact look Uniform mode
+        was just rendering (sampled at the cutoff, the geometric-mean
+        midpoint, and the full-effect diameter), so the preview doesn't
+        jump and the three tabs become a starting point the user can then
+        diverge from ("make variations on their Per-size range") instead of
+        overwriting their own later per-size edits on every toggle back -
+        _on_spike_mode_change only calls this on the uniform->per_size
+        transition, not on every re-selection of "Per size"."""
+        anchors_sorted = sorted(self._uniform_anchors(), key=lambda a: a["diam"])
+        lo_d, hi_d = anchors_sorted[0]["diam"], anchors_sorted[-1]["diam"]
+        mid_d = (lo_d * hi_d) ** 0.5  # geometric mean - matches the log-diameter blend's midpoint
+        for av, diam_range, target_diam in zip(
+                self.spike_anchors, SPIKE_ANCHOR_DIAM_RANGES, (lo_d, mid_d, hi_d)):
+            av["diam"].set(min(diam_range[1], max(diam_range[0], target_diam)))
+            params = _interp_anchor_params(anchors_sorted, target_diam)
+            for key in _ANCHOR_PARAM_KEYS:
+                av[key].set(params[key])
+
+    def _update_spike_mode_ui(self):
+        """Shows whichever of the notebook (per-size tabs) / flat uniform
+        panel matches the active mode, and swaps the matching help text -
+        only one of the two control sets is ever visible at once."""
+        if self.spike_mode.get() == "uniform":
+            self._spike_notebook.grid_remove()
+            self._spike_uniform_frame.grid()
+            self._spike_help_label.config(text=self._spike_help_uniform)
+        else:
+            self._spike_uniform_frame.grid_remove()
+            self._spike_notebook.grid()
+            self._spike_help_label.config(text=self._spike_help_per_size)
 
     def _spike_supersample(self, ph, pw):
         """How much to render the spike layer oversized before area-
@@ -1628,10 +1853,16 @@ class App:
         larger and properly downsampling avoids that, at a bounded cost."""
         fh, fw = self.full_shape
         scale = pw / max(fw, 1)
-        # The thinnest of the 3 anchors sets the aliasing risk - a preview
-        # supersampled only enough for a thick "Large" spike would still
-        # alias a thin "Small" one.
-        th = min(av["thickness"].get() for av in self.spike_anchors) * scale
+        # The thinnest actually-rendered thickness sets the aliasing risk -
+        # a preview supersampled only enough for a thick "Large" spike would
+        # still alias a thin "Small" one. In "uniform" mode the synthetic
+        # zero-anchor's thickness is never actually rendered (it only marks
+        # the cutoff where the ray fades out entirely), so the dialled-in
+        # slider value itself is the right thinnest-case estimate there.
+        if self.spike_mode.get() == "uniform":
+            th = self.spike_uniform["thickness"].get() * scale
+        else:
+            th = min(av["thickness"].get() for av in self.spike_anchors) * scale
         if th >= 0.5:
             return 1
         return int(min(4, max(1, np.ceil(0.5 / max(th, 1e-3)))))
@@ -2295,15 +2526,29 @@ def main():
     root = tk.Tk()
     root.title(f"frankSpikes {APP_VERSION} — by Frank Sferlazza")
     root.minsize(700, 500)
+    # Kept as an attribute, not a local var: Tk only keeps a PhotoImage
+    # alive as long as something in Python still references it, and a
+    # bare local would be garbage-collected (silently reverting to the
+    # default feather icon) as soon as main() moves on to mainloop().
+    root._app_icon = ImageTk.PhotoImage(build_app_icon())
+    root.iconphoto(True, root._app_icon)
     App(root, worker)
     # Size to the window's actual required content (computed only once all
     # widgets exist) rather than a fixed guess - a fixed guess is exactly
     # what let the bottom-right status bar labels get clipped once the
     # window had more content in it than when that guess was picked.
+    # Height is then capped to what actually fits the screen: the two
+    # sidebars' content (esp. the Diffraction Spikes column) can easily
+    # need more vertical room than a laptop screen has, and each sidebar
+    # already has its own working scrollbar (_make_scrollable_frame) for
+    # exactly that case - growing the window past the screen instead just
+    # forces the user to resize it manually before they can reach the
+    # "Process" button or status bar.
     root.update_idletasks()
     req_w = max(1500, root.winfo_reqwidth())
     req_h = max(820, root.winfo_reqheight())
-    root.geometry(f"{req_w}x{req_h}")
+    max_h = max(700, root.winfo_screenheight() - 80)
+    root.geometry(f"{req_w}x{min(req_h, max_h)}")
     root.mainloop()
 
 
