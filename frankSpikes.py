@@ -99,6 +99,7 @@ HOW TO USE IT
 import os
 import sys
 import math
+import collections
 import threading
 import queue
 import traceback
@@ -1244,10 +1245,13 @@ def _phys_channel_scales(dispersion):
     return [1.0 + d * (lam / PHYS_LAMBDA_REF - 1.0) for lam in PHYS_LAMBDA_RGB]
 
 
-# Edge-diffraction gain constants for polygon apertures, set by the calibration
-# test against the FFT (tests/test_phys_fft.py). 1.0 until calibrated.
-PHYS_EDGE_KAPPA_EVEN = 1.0
-PHYS_EDGE_KAPPA_ODD = 1.0
+# Edge-diffraction gain constants for polygon apertures, calibrated against the
+# FFT template (tests/test_phys_fft.py). Measured FFT/model ratios at kappa=1:
+# even n (6, 8) 0.29-0.55; odd n (5, 7) 0.08-0.17 and falling with distance, so
+# the analytic odd-blade spikes run a little bright far out (the FFT branch used
+# for large stars is exact).
+PHYS_EDGE_KAPPA_EVEN = 0.39
+PHYS_EDGE_KAPPA_ODD = 0.12
 PHYS_VANE_LAT = 0.376         # sigma of the lateral profile per unit (D / vane length)
 
 
@@ -1419,6 +1423,147 @@ def _phys_draw_streaks(cv, ox, oy, cx, cy, fwhm_px, u, p, star_color, flux, sx, 
         for c in range(3):
             sub = cv[y0:y1, x0:x1, c]
             np.maximum(sub, (peak * prof * mult[c]).astype(np.float32), out=sub)
+
+
+_PHYS_TPL_N = 1024
+_PHYS_TPL_D = 64.0
+_PHYS_TPL_LAMD = _PHYS_TPL_N / _PHYS_TPL_D          # template px per lambda/D at 530 nm
+_PHYS_TPL_LAMBDAS = np.linspace(430.0, 670.0, 8)
+_PHYS_TPL_MAX = 4
+_PHYS_TPL_LEVELS = 4
+_PHYS_SENSOR = ((600.0, 40.0), (535.0, 40.0), (455.0, 30.0))   # (centre, sigma) of R, G, B
+_phys_tpl_cache = collections.OrderedDict()
+_phys_tpl_lock = threading.Lock()
+
+
+def _phys_pupil(N, D, eps, aperture, blades, rotation_deg, vane_frac, with_vanes=True):
+    """Soft-edged pupil transmission on an N x N grid (aperture diameter D px)."""
+    y, x = np.mgrid[:N, :N].astype(np.float32)
+    x -= N / 2.0
+    y -= N / 2.0
+    r = np.hypot(x, y)
+    soft = lambda d: np.clip(d + 0.5, 0.0, 1.0)
+    if aperture == "polygon":
+        n = int(blades)
+        apothem = D / 2.0 * np.cos(np.pi / n)
+        ins = np.full_like(r, 1e9)
+        for k in range(n):
+            phi = np.radians(rotation_deg + 90.0 + 360.0 * k / n)
+            ins = np.minimum(ins, apothem - (x * np.cos(phi) + y * np.sin(phi)))
+        pup = soft(ins)
+    else:
+        pup = soft(D / 2.0 - r)
+    if eps > 0.0:
+        pup = pup * soft(r - eps * D / 2.0)
+    if with_vanes and aperture != "polygon":
+        w = vane_frac * D
+        base = rotation_deg if aperture == "spider4" else rotation_deg + 90.0
+        step, count = (90.0, 4) if aperture == "spider4" else (120.0, 3)
+        for k in range(count):
+            t = np.radians(base + step * k)
+            along = x * np.cos(t) + y * np.sin(t)
+            perp = -x * np.sin(t) + y * np.cos(t)
+            cover = np.clip(np.minimum(perp + 0.5, w / 2.0) - np.maximum(perp - 0.5, -w / 2.0), 0.0, 1.0)
+            pup = pup * (1.0 - cover * (along > 0.0))
+    return pup.astype(np.float32)
+
+
+def _phys_mips(a):
+    out = [a]
+    for _ in range(_PHYS_TPL_LEVELS - 1):
+        b = out[-1]
+        out.append(0.25 * (b[0::2, 0::2] + b[1::2, 0::2] + b[0::2, 1::2] + b[1::2, 1::2]))
+    return out
+
+
+def _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion):
+    N, D = _PHYS_TPL_N, _PHYS_TPL_D
+    d = dispersion / 100.0
+    lams = _PHYS_TPL_LAMBDAS if d > 0.0 else np.array([PHYS_LAMBDA_REF])
+    wts = np.array([[np.exp(-0.5 * ((l - c) / s) ** 2) for l in lams] for c, s in _PHYS_SENSOR])
+    wts /= wts.sum(axis=1, keepdims=True)
+    yy, xx = np.mgrid[:N, :N].astype(np.float32)
+    r = np.hypot(xx - N / 2.0, yy - N / 2.0)
+    ref_peak = float(_phys_pupil(N, D, eps, aperture, blades, rotation_deg, vane_frac, False).sum())
+    full = np.zeros((N, N, 3), np.float32)
+    ring = np.zeros((N, N, 3), np.float32)
+    for i, lam in enumerate(lams):
+        lam_eff = PHYS_LAMBDA_REF + d * (lam - PHYS_LAMBDA_REF)
+        pup = _phys_pupil(N, D * PHYS_LAMBDA_REF / lam_eff, eps, aperture, blades, rotation_deg, vane_frac)
+        F = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(pup)))
+        I = ((F.real ** 2 + F.imag ** 2) / max(float(pup.sum()), 1e-9) / ref_peak).astype(np.float32)
+        rho = r / (_PHYS_TPL_LAMD * lam_eff / PHYS_LAMBDA_REF)
+        ir = (_airy_obstructed_intensity(rho, eps) * (PHYS_LAMBDA_REF / lam_eff) ** 2).astype(np.float32)
+        for c in range(3):
+            full[..., c] += wts[c, i] * I
+            ring[..., c] += wts[c, i] * ir
+    spk = np.maximum(full - ring, 0.0)
+    return {"N": N, "ring": _phys_mips(ring), "spk": _phys_mips(spk)}
+
+
+def _phys_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion):
+    """Polychromatic PSF template (ring part + spike part) for one aperture
+    setup, cached (LRU, lock-protected). eps and vane_frac are fractions."""
+    key = (aperture, int(blades) if aperture == "polygon" else 0, round(float(rotation_deg), 2),
+           round(float(eps), 3), round(float(vane_frac), 5), round(float(dispersion), 1))
+    with _phys_tpl_lock:
+        tpl = _phys_tpl_cache.get(key)
+        if tpl is not None:
+            _phys_tpl_cache.move_to_end(key)
+            return tpl
+    tpl = _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion)
+    with _phys_tpl_lock:
+        _phys_tpl_cache[key] = tpl
+        while len(_phys_tpl_cache) > _PHYS_TPL_MAX:
+            _phys_tpl_cache.popitem(last=False)
+    return tpl
+
+
+def _phys_bilinear(arr, fx, fy):
+    h, w = arr.shape[:2]
+    x0 = np.floor(fx).astype(np.intp)
+    y0 = np.floor(fy).astype(np.intp)
+    tx = (fx - x0).astype(np.float32)[..., None]
+    ty = (fy - y0).astype(np.float32)[..., None]
+    x0c, x1c = np.clip(x0, 0, w - 1), np.clip(x0 + 1, 0, w - 1)
+    y0c, y1c = np.clip(y0, 0, h - 1), np.clip(y0 + 1, 0, h - 1)
+    return ((arr[y0c, x0c] * (1 - tx) + arr[y0c, x1c] * tx) * (1 - ty)
+            + (arr[y1c, x0c] * (1 - tx) + arr[y1c, x1c] * tx) * ty)
+
+
+def _phys_draw_fft(cv, ox, oy, cx, cy, fwhm_px, u, p, tpl, star_color, flux):
+    """Stamp one large star from the FFT template (see spec 4.4)."""
+    if p["depth"] <= 0.0:
+        return
+    ch, cw = cv.shape[:2]
+    Nt = tpl["N"]
+    ratio = u / _PHYS_TPL_LAMD                     # image px per template px
+    R_t = 0.49 * Nt * ratio
+    X = max(p["extent"] * fwhm_px, 1.0)
+    R = min(X, R_t)
+    lx, ly = cx - ox, cy - oy
+    box = _phys_clip_box(lx - R, ly - R, lx + R, ly + R, cw, ch)
+    if box is None:
+        return
+    x0, y0, x1, y1 = box
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    dx, dy = xx - lx, yy - ly
+    r = np.hypot(dx, dy)
+    level = int(np.clip(np.floor(np.log2(max(1.0 / ratio, 1.0))), 0, len(tpl["ring"]) - 1))
+    div = 2.0 ** level
+    fx = (dx / ratio + Nt / 2.0 + 0.5) / div - 0.5
+    fy = (dy / ratio + Nt / 2.0 + 0.5) / div - 0.5
+    ring = _phys_bilinear(tpl["ring"][level], fx, fy)
+    spk = _phys_bilinear(tpl["spk"][level], fx, fy)
+    I = (p["rings"] / 100.0 * ring + p["spikes"] / 100.0 * spk) * flux
+    G = 10.0 ** (6.0 * p["depth"] / 100.0)
+    norm = np.arcsinh(G)
+    mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.85 * R) / (0.15 * R)))
+    mult = _phys_color_mult(p, star_color)
+    for c in range(3):
+        v = (_phys_display(I[..., c], G, norm) * mask * mult[c]).astype(np.float32)
+        sub = cv[y0:y1, x0:x1, c]
+        np.maximum(sub, v, out=sub)
 
 
 class SirilWorker:
