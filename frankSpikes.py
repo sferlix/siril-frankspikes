@@ -1192,6 +1192,105 @@ def apply_spikes(rgb, layer):
     return np.clip(out, 0.0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Physical spikes (second layer; see docs/superpowers/specs/2026-09-21-physical-spikes-design.md)
+# ---------------------------------------------------------------------------
+PHYS_LAMBDA_REF = 530.0
+PHYS_LAMBDA_RGB = (600.0, 530.0, 450.0)
+PHYS_FWHM_PER_LAMD = 1.03     # Airy core FWHM in units of lambda/D
+
+
+def _smoothstep_arr(t):
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _bessel_j1(x):
+    """Bessel J1 with the Abramowitz & Stegun 9.4.4 / 9.4.6 polynomials (numpy
+    only, so no scipy dependency inside Siril's Python)."""
+    x = np.asarray(x, dtype=np.float64)
+    ax = np.abs(x)
+    out = np.empty_like(ax)
+    small = ax <= 3.0
+    t = (ax[small] / 3.0) ** 2
+    out[small] = ax[small] * (0.5 + t * (-0.56249985 + t * (0.21093573 + t * (
+        -0.03954289 + t * (0.00443319 + t * (-0.00031761 + t * 0.00001109))))))
+    big = ~small
+    xb = ax[big]
+    y = 3.0 / xb
+    f1 = 0.79788456 + y * (0.00000156 + y * (0.01659667 + y * (0.00017105 + y * (
+        -0.00249511 + y * (0.00113653 + y * -0.00020033)))))
+    th = xb - 2.35619449 + y * (0.12499612 + y * (0.00005650 + y * (-0.00637879 + y * (
+        0.00074348 + y * (0.00079824 + y * -0.00029166)))))
+    out[big] = f1 * np.cos(th) / np.sqrt(xb)
+    return np.sign(x) * out
+
+
+def _airy_obstructed_intensity(rho, eps):
+    """Airy pattern intensity (peak 1) of a circular aperture with central
+    obstruction ratio `eps`, at radius `rho` in lambda/D units."""
+    x = np.maximum(np.pi * np.asarray(rho, dtype=np.float64), 1e-9)
+    a = 2.0 * _bessel_j1(x) / x
+    if eps > 0.0:
+        b = 2.0 * _bessel_j1(eps * x) / (eps * x)
+        a = (a - eps * eps * b) / (1.0 - eps * eps)
+    return a * a
+
+
+def _phys_channel_scales(dispersion):
+    """Per-channel (R,G,B) scale of the diffraction pattern: proportional to
+    wavelength, blended toward 1 by dispersion (100 = physical)."""
+    d = dispersion / 100.0
+    return [1.0 + d * (lam / PHYS_LAMBDA_REF - 1.0) for lam in PHYS_LAMBDA_RGB]
+
+
+# Edge-diffraction gain constants for polygon apertures, set by the calibration
+# test against the FFT (tests/test_phys_fft.py). 1.0 until calibrated.
+PHYS_EDGE_KAPPA_EVEN = 1.0
+PHYS_EDGE_KAPPA_ODD = 1.0
+PHYS_VANE_LAT = 0.376         # sigma of the lateral profile per unit (D / vane length)
+
+
+def _phys_spike_lines(aperture, blades, rotation_deg):
+    """Half-rays of the diffraction pattern as dicts: angle (deg, image
+    coordinates), kind ("vane"|"edge"), gain (intensity multiplier), lat
+    (lateral sigma in lambda/D before the obstruction correction)."""
+    rot = float(rotation_deg)
+    lines = []
+    if aperture == "spider4":
+        for k in range(4):
+            lines.append({"angle": rot + 90.0 * k, "kind": "vane", "gain": 1.0, "lat": PHYS_VANE_LAT})
+    elif aperture == "spider3":
+        for k in range(6):
+            lines.append({"angle": rot + 60.0 * k, "kind": "vane", "gain": 0.25, "lat": 2.0 * PHYS_VANE_LAT})
+    else:
+        n = int(blades)
+        edge = np.sin(np.pi / n)
+        area = (n / 8.0) * np.sin(2.0 * np.pi / n)
+        kappa = PHYS_EDGE_KAPPA_ODD if n % 2 else PHYS_EDGE_KAPPA_EVEN
+        gain = kappa * (edge / area) ** 2
+        for k in range(n):
+            ang = rot + 90.0 + 360.0 * k / n
+            lines.append({"angle": ang, "kind": "edge", "gain": gain, "lat": PHYS_VANE_LAT / edge})
+            if n % 2:
+                lines.append({"angle": ang + 180.0, "kind": "edge", "gain": gain, "lat": PHYS_VANE_LAT / edge})
+    return lines
+
+
+def _phys_spike_along(a, ln, eps, vane_frac):
+    """Intensity (relative to the star's peak) along a spike at distance `a`
+    (lambda/D units, >= 0): vane plateau P/(1+(a/a_w)^2) or edge K/(pi a)^2,
+    switched on beyond the Airy near field."""
+    turn_on = _smoothstep_arr((a - 1.0) / 2.0)
+    if ln["kind"] == "vane":
+        plateau = (4.0 * vane_frac / (np.pi * (1.0 + eps))) ** 2 * ln["gain"]
+        a_w = 1.0 / (np.pi * vane_frac)
+        prof = plateau / (1.0 + (a / a_w) ** 2)
+    else:
+        prof = ln["gain"] / (np.pi * np.maximum(a, 1e-3)) ** 2
+    return prof * turn_on
+
+
 class SirilWorker:
     """Holds the connection to Siril and serializes all calls on a single thread."""
 
