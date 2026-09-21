@@ -131,6 +131,7 @@ SPIKE_ANCHOR_PARAM_DEFS = [
     ("intensity",  "Intensity",                          0,   250, 5,   "{:.0f}"),
     ("thickness",  "Thickness",                          0.1, 6,   0.1, "{:.1f}"),
     ("soft_flare", "Soft flare",                          0,   100, 5,   "{:.0f}"),
+    ("flare_tail", "Soft flare tail length (x star diameter)", 0, 30,  0.5, "{:.1f}x"),
     ("ring_flare", "Ring flare",                          0,   100, 5,   "{:.0f}"),
     ("chroma",     "Color fringing (chromatic)",          0,   100, 5,   "{:.0f}"),
     ("rainbow",    "Rainbow intensity",                   0,   100, 5,   "{:.0f}"),
@@ -198,14 +199,14 @@ SPIKE_DEFAULTS = {
     "variation": 15.0,
     "anchors": [
         {"diam": 3.0, "length": 2.0, "intensity": 40.0, "thickness": 0.8,
-         "soft_flare": 0.0, "ring_flare": 0.0, "chroma": 0.0, "rainbow": 0.0,
-         "saturation": 0.0},
+         "soft_flare": 0.0, "flare_tail": 0.0, "ring_flare": 0.0, "chroma": 0.0,
+         "rainbow": 0.0, "saturation": 0.0},
         {"diam": 8.0, "length": 4.0, "intensity": 110.0, "thickness": 1.1,
-         "soft_flare": 11.0, "ring_flare": 7.0, "chroma": 21.0, "rainbow": 21.0,
-         "saturation": 0.0},
+         "soft_flare": 11.0, "flare_tail": 0.0, "ring_flare": 7.0, "chroma": 21.0,
+         "rainbow": 21.0, "saturation": 0.0},
         {"diam": 18.0, "length": 6.5, "intensity": 170.0, "thickness": 1.6,
-         "soft_flare": 35.0, "ring_flare": 20.0, "chroma": 45.0, "rainbow": 35.0,
-         "saturation": 55.0},
+         "soft_flare": 35.0, "flare_tail": 0.0, "ring_flare": 20.0, "chroma": 45.0,
+         "rainbow": 35.0, "saturation": 55.0},
     ],
 }
 
@@ -226,7 +227,7 @@ SPIKE_UNIFORM_REF_MULT = 4.0
 SPIKE_UNIFORM_DEFAULTS = {
     "min_diam": 3.0,
     "length": 5.0, "intensity": 140.0, "thickness": 1.0,
-    "soft_flare": 15.0, "ring_flare": 5.0, "chroma": 15.0,
+    "soft_flare": 15.0, "flare_tail": 0.0, "ring_flare": 5.0, "chroma": 15.0,
     "rainbow": 0.0, "saturation": 25.0,
 }
 
@@ -908,10 +909,12 @@ def _add_spike_ray(layer, cx, cy, angle_deg, length_px, thickness_px, peak,
     layer[y0:y1, x0:x1, 2] = np.maximum(layer[y0:y1, x0:x1, 2], base * b_mult)
 
 
-def _add_soft_flare(layer, cx, cy, radius_px, peak):
+def _add_soft_flare(layer, cx, cy, radius_px, peak, tail_len_px=0.0):
     """A large, very soft circular glow around the star in every direction
     (not just along the rays) - mimics sensor/optics bloom around bright
-    stars."""
+    stars. With tail_len_px > 0 a power-law tail (equal to the gaussian at
+    2 sigma, so no seam) extends the glow out to that radius; 0 keeps the
+    original gaussian-only glow bit for bit."""
     if radius_px < 1.0 or peak <= 0:
         return
     h, w, _ = layer.shape
@@ -922,6 +925,8 @@ def _add_soft_flare(layer, cx, cy, radius_px, peak):
     # worse the bigger the star. 3 sigma decays to ~1%, small enough that
     # clipping it there reads as a clean circular falloff instead.
     pad = sigma * 3.0 + 1.0
+    if tail_len_px > 0:
+        pad = max(pad, tail_len_px + 1.0)
     x0 = int(max(0, np.floor(cx - pad)))
     x1 = int(min(w, np.ceil(cx + pad)))
     y0 = int(max(0, np.floor(cy - pad)))
@@ -932,6 +937,11 @@ def _add_soft_flare(layer, cx, cy, radius_px, peak):
     r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
     falloff = np.exp(-(r ** 2) / (2.0 * sigma ** 2))
     contrib = peak * falloff
+    if tail_len_px > 0:
+        tail = peak * (1.0 + (r / sigma) ** 2) ** -1.25
+        t = np.clip((r - 0.6 * tail_len_px) / (0.4 * tail_len_px), 0.0, 1.0)
+        tail = tail * (1.0 - t * t * (3.0 - 2.0 * t))
+        contrib = np.maximum(contrib, tail)
     layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
 
 
@@ -961,7 +971,7 @@ def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak):
     layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
 
 
-_ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare",
+_ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare", "flare_tail",
                       "ring_flare", "chroma", "rainbow", "saturation")
 
 
@@ -970,8 +980,9 @@ def _smoothstep(t):
     return t * t * (3.0 - 2.0 * t)
 
 
-def _interp_anchor_params(anchors_sorted, fwhm):
-    """Blend the 8 size-dependent spike parameters for a star of diameter
+def _interp_anchor_params(anchors_sorted, fwhm, keys=None):
+    """Blend the size-dependent spike parameters (`keys`, the classic
+    _ANCHOR_PARAM_KEYS by default; a missing key reads as 0) for a star of diameter
     `fwhm`, from `anchors_sorted` (2 or more size-anchor dicts - 3 for the
     Small/Medium/Large per-size tabs, 2 synthetic ones for Uniform mode's
     single slider set - sorted by their own "diam", so the user is free to
@@ -984,19 +995,20 @@ def _interp_anchor_params(anchors_sorted, fwhm):
     apart in size never show a visible kink at an anchor. Flat below the
     smallest anchor and above the largest: no extrapolation past what the
     user actually dialled in for that end of the range."""
+    keys = _ANCHOR_PARAM_KEYS if keys is None else keys
     lo, hi = anchors_sorted[0], anchors_sorted[-1]
     if fwhm <= lo["diam"]:
-        return {k: lo[k] for k in _ANCHOR_PARAM_KEYS}
+        return {k: lo.get(k, 0.0) for k in keys}
     if fwhm >= hi["diam"]:
-        return {k: hi[k] for k in _ANCHOR_PARAM_KEYS}
+        return {k: hi.get(k, 0.0) for k in keys}
     for a, b in zip(anchors_sorted, anchors_sorted[1:]):
         if a["diam"] <= fwhm <= b["diam"]:
             span = np.log(max(b["diam"], 1e-6)) - np.log(max(a["diam"], 1e-6))
             t = 0.5 if span <= 1e-9 else (
                 (np.log(fwhm) - np.log(max(a["diam"], 1e-6))) / span)
             t = _smoothstep(t)
-            return {k: a[k] + (b[k] - a[k]) * t for k in _ANCHOR_PARAM_KEYS}
-    return {k: hi[k] for k in _ANCHOR_PARAM_KEYS}  # unreachable if sorted
+            return {k: a.get(k, 0.0) + (b.get(k, 0.0) - a.get(k, 0.0)) * t for k in keys}
+    return {k: hi.get(k, 0.0) for k in keys}  # unreachable if sorted
 
 
 def _star_jitter_pair(x, y):
@@ -1123,7 +1135,8 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
                                    max(ray_len_px * 1.2, fwhm * 2.0 * scale))
             if flare_radius_px >= 1.0:
                 flare_peak = (p["soft_flare"] / 100.0) * rel_amp * 0.8
-                _add_soft_flare(layer, cx, cy, flare_radius_px, flare_peak)
+                _add_soft_flare(layer, cx, cy, flare_radius_px, flare_peak,
+                                p.get("flare_tail", 0.0) * fwhm * scale)
 
         if p["ring_flare"] > 0:
             # A real diffraction ring comes from the aperture itself (a
