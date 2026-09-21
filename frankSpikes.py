@@ -1291,6 +1291,136 @@ def _phys_spike_along(a, ln, eps, vane_frac):
     return prof * turn_on
 
 
+def _phys_clip_box(x0, y0, x1, y1, w, h):
+    ix0, iy0 = int(max(0, np.floor(x0))), int(max(0, np.floor(y0)))
+    ix1, iy1 = int(min(w, np.ceil(x1) + 1)), int(min(h, np.ceil(y1) + 1))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    return ix0, iy0, ix1, iy1
+
+
+def _phys_mask(r, fwhm_px, extent_px):
+    """Core exclusion (the star already has its own core) times a smooth fade
+    to zero at the spike extent."""
+    core = _smoothstep_arr((r - 0.5 * fwhm_px) / (0.6 * fwhm_px))
+    ext = 1.0 - _smoothstep_arr((r - 0.75 * extent_px) / (0.25 * extent_px))
+    return core * ext
+
+
+def _phys_display(I, G, norm):
+    return np.arcsinh(G * I) / norm
+
+
+def _phys_color_mult(p, star_color):
+    k = min(1.0, max(0.0, p["color"] / 100.0))
+    return [(1.0 - k) + k * float(star_color[c]) for c in range(3)]
+
+
+def _phys_strip_box(cx, cy, angle_deg, length, half_w, w, h):
+    th = np.radians(angle_deg)
+    c, s = np.cos(th), np.sin(th)
+    nx, ny = -s * half_w, c * half_w
+    xs = (cx + nx, cx - nx, cx + c * length + nx, cx + c * length - nx)
+    ys = (cy + ny, cy - ny, cy + s * length + ny, cy + s * length - ny)
+    return _phys_clip_box(min(xs), min(ys), max(xs), max(ys), w, h)
+
+
+def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, flux, blades=6):
+    """Closed-form rings + spikes of one star into canvas `cv` (pixel (i, j)
+    of cv is layer pixel (oy + i, ox + j)); see spec 4.3."""
+    if p["depth"] <= 0.0:
+        return
+    ch, cw = cv.shape[:2]
+    eps = min(0.95, max(0.0, p["obstruction"] / 100.0))
+    vane = max(p["vane"] / 100.0, 1e-4)
+    scales = _phys_channel_scales(p["dispersion"])
+    G = 10.0 ** (6.0 * p["depth"] / 100.0)
+    norm = np.arcsinh(G)
+    mult = _phys_color_mult(p, star_color)
+    X = max(p["extent"] * fwhm_px, 1.0)
+    rings_gain, spikes_gain = p["rings"] / 100.0, p["spikes"] / 100.0
+    lx, ly = cx - ox, cy - oy
+
+    if rings_gain > 0.0:
+        R = min(X, 24.0 * u * max(scales))
+        box = _phys_clip_box(lx - R, ly - R, lx + R, ly + R, cw, ch)
+        if box is not None:
+            x0, y0, x1, y1 = box
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            r = np.hypot(xx - lx, yy - ly)
+            mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.8 * R) / (0.2 * R)))
+            for c in range(3):
+                sc = scales[c]
+                I = rings_gain * _airy_obstructed_intensity(r / (u * sc), eps) / (sc * sc) * flux
+                v = _phys_display(I, G, norm) * mask * mult[c]
+                sub = cv[y0:y1, x0:x1, c]
+                np.maximum(sub, v.astype(np.float32), out=sub)
+
+    if spikes_gain > 0.0:
+        for ln in lines:
+            sigq = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
+            half_w = 4.5 * sigq * u * max(scales) + 1.0
+            box = _phys_strip_box(lx, ly, ln["angle"], X, half_w, cw, ch)
+            if box is None:
+                continue
+            x0, y0, x1, y1 = box
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            dx, dy = xx - lx, yy - ly
+            r = np.hypot(dx, dy)
+            mask = _phys_mask(r, fwhm_px, X)
+            th = np.radians(ln["angle"])
+            ca, sa = np.cos(th), np.sin(th)
+            for c in range(3):
+                sc = scales[c]
+                uc = u * sc
+                a = (dx * ca + dy * sa) / uc
+                q = (-dx * sa + dy * ca) / uc
+                along = _phys_spike_along(np.maximum(a, 0.0), ln, eps, vane) * (a > 0.0)
+                I = spikes_gain * along * np.exp(-(q * q) / (2.0 * sigq * sigq)) / (sc * sc) * flux
+                v = _phys_display(I, G, norm) * mask * mult[c]
+                sub = cv[y0:y1, x0:x1, c]
+                np.maximum(sub, v.astype(np.float32), out=sub)
+
+
+def _phys_hash01(x, y, i, salt):
+    a, b = _star_jitter_pair(x * (1.0 + 0.137 * salt) + 13.7 * i, y * (1.0 + 0.071 * salt) + 7.3 * i)
+    return 0.5 * (a + 1.0) if salt % 2 == 0 else 0.5 * (b + 1.0)
+
+
+def _phys_draw_streaks(cv, ox, oy, cx, cy, fwhm_px, u, p, star_color, flux, sx, sy):
+    """Thin dust/scratch streaks with deterministic random angle, length and
+    brightness (seeded by the star's own position). Display units, not
+    multiplied by depth."""
+    amount = p["streaks"] / 100.0
+    if amount <= 0.0:
+        return
+    ch, cw = cv.shape[:2]
+    lx, ly = cx - ox, cy - oy
+    mult = _phys_color_mult(p, star_color)
+    sigma = max(0.6, 0.15 * u)
+    n = int(round(amount * 14.0))
+    for i in range(n):
+        ang = 360.0 * _phys_hash01(sx, sy, i, 0)
+        length = (0.4 + 0.6 * _phys_hash01(sx, sy, i, 1)) * p["streak_len"] * fwhm_px
+        bright = 0.3 + 0.7 * _phys_hash01(sx, sy, i, 2)
+        peak = 0.5 * amount * flux * bright
+        box = _phys_strip_box(lx, ly, ang, length, 4.0 * sigma + 1.0, cw, ch)
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        dx, dy = xx - lx, yy - ly
+        th = np.radians(ang)
+        along = dx * np.cos(th) + dy * np.sin(th)
+        perp = -dx * np.sin(th) + dy * np.cos(th)
+        t = np.clip(along / max(length, 1e-6), 0.0, 1.0)
+        prof = np.exp(-(perp * perp) / (2.0 * sigma * sigma)) * (1.0 - t) ** 1.2 * (along > 0.0)
+        prof = prof * _smoothstep_arr((np.hypot(dx, dy) - 0.5 * fwhm_px) / (0.6 * fwhm_px))
+        for c in range(3):
+            sub = cv[y0:y1, x0:x1, c]
+            np.maximum(sub, (peak * prof * mult[c]).astype(np.float32), out=sub)
+
+
 class SirilWorker:
     """Holds the connection to Siril and serializes all calls on a single thread."""
 
