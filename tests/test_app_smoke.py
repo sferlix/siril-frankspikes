@@ -143,5 +143,49 @@ class TestPipeline(AppCase):
         self.assertIsNone(a._phys_layer_key)
 
 
+def shown(widget):
+    return widget.winfo_manager() != ""
+
+
+class TestPhysUI(AppCase):
+    def test_simple_mode_shows_uniform_frame(self):
+        a = self.app
+        a.spike_mode.set("uniform")
+        a._update_spike_mode_ui()
+        self.assertTrue(shown(a._phys_uniform_frame))
+        self.assertFalse(shown(a._phys_notebook))
+        self.assertFalse(shown(a._phys_star_frame))
+
+    def test_per_size_mode_shows_notebook_with_three_tabs(self):
+        a = self.app
+        a.spike_mode.set("per_size")
+        a._update_spike_mode_ui()
+        self.assertTrue(shown(a._phys_notebook))
+        self.assertEqual(len(a._phys_notebook.tabs()), 3)
+        self.assertFalse(shown(a._phys_uniform_frame))
+
+    def test_selecting_a_star_shows_both_star_panels(self):
+        a = self.app
+        a._stars = [(10.0, 10.0, 12.0, 0.5, (1, 1, 1))]
+        a._select_star(("auto", 0))
+        self.assertTrue(shown(a._phys_star_frame))
+        self.assertTrue(shown(a._spike_star_frame))
+        self.assertFalse(shown(a._phys_uniform_frame))
+        a._deselect_star()
+        self.assertFalse(shown(a._phys_star_frame))
+        self.assertTrue(shown(a._phys_uniform_frame))
+
+    def test_moving_a_physical_star_slider_creates_an_override(self):
+        a = self.app
+        a._stars = [(10.0, 10.0, 12.0, 0.5, (1, 1, 1))]
+        a._select_star(("auto", 0))
+        a.phys_star["depth"].set(42.0)
+        a._on_phys_star_slider_change()
+        self.assertEqual(a._phys_star_overrides[("auto", 0)]["depth"], 42.0)
+        self.assertNotIn(("auto", 0), a._spike_star_overrides)
+        a._reset_selected_phys_override()
+        self.assertNotIn(("auto", 0), a._phys_star_overrides)
+
+
 if __name__ == "__main__":
     unittest.main()

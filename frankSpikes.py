@@ -2404,6 +2404,71 @@ class App:
                    command=self._deselect_star).grid(
             row=r + 1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
 
+        # ---- Physical spikes: a second, physics-based layer combined (screen)
+        # with the classic spikes above. Follows the same Simple / Per size
+        # selector and the same Shift+Click star selection. ----
+        frm_phys = ttk.LabelFrame(frm_spikes, text="Physical spikes (beta)")
+        frm_phys.grid(row=13, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        frm_phys.grid_columnconfigure(0, minsize=210)
+        ttk.Checkbutton(frm_phys, text="Enable physical spikes", variable=self.phys_enabled,
+                         command=self._on_spike_slider).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
+        ttk.Label(frm_phys, text="Aperture", style="Card.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 0))
+        ap_box = ttk.Frame(frm_phys, style="Card.TFrame")
+        ap_box.grid(row=2, column=0, columnspan=3, sticky="w", padx=10)
+        for text, val in (("Spider, 4 vanes (4 spikes)", "spider4"),
+                          ("Spider, 3 vanes (6 spikes)", "spider3"),
+                          ("Diaphragm blades (polygon)", "polygon")):
+            ttk.Radiobutton(ap_box, text=text, value=val, variable=self.phys_aperture,
+                             command=self._on_spike_slider).pack(anchor="w")
+        self._add_slider(frm_phys, 3, "Blades (polygon only; odd = twice as many spikes)",
+                          self.phys_blades, self.phys_blades_label, 5, 9, step=1,
+                          on_change=self._on_spike_slider)
+        self._add_slider(frm_phys, 5, "Rotation angle (0-90 deg)",
+                          self.phys_rotation, self.phys_rotation_label, 0, 90, step=1,
+                          on_change=self._on_spike_slider)
+        self._add_slider(frm_phys, 7, "Use FFT model from star diameter (px, 200 = never)",
+                          self.phys_fft_from, self.phys_fft_from_label, 3, 200, step=1,
+                          on_change=self._on_spike_slider)
+
+        self._phys_notebook = ttk.Notebook(frm_phys)
+        self._phys_notebook.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
+        for tab_label, av in zip(PHYS_TAB_LABELS, self.phys_anchors):
+            tab = ttk.Frame(self._phys_notebook, style="Card.TFrame")
+            tab.grid_columnconfigure(0, minsize=200)
+            self._phys_notebook.add(tab, text=tab_label)
+            r = 0
+            for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
+                self._add_slider(tab, r, label, av[key], av[key + "_label"], lo, hi, step=step,
+                                  on_change=self._on_spike_slider)
+                r += 2
+
+        self._phys_uniform_frame = ttk.Frame(frm_phys, style="Card.TFrame")
+        self._phys_uniform_frame.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
+        self._phys_uniform_frame.grid_columnconfigure(0, minsize=200)
+        r = 0
+        for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
+            self._add_slider(self._phys_uniform_frame, r, label, self.phys_uniform[key],
+                              self.phys_uniform[key + "_label"], lo, hi, step=step,
+                              on_change=self._on_spike_slider)
+            r += 2
+
+        self._phys_star_frame = ttk.Frame(frm_phys, style="Card.TFrame")
+        self._phys_star_frame.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
+        self._phys_star_frame.grid_columnconfigure(0, minsize=200)
+        ttk.Label(self._phys_star_frame, text="Physical look of the selected star",
+                  style="Card.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 2))
+        r = 2
+        for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
+            self._add_slider(self._phys_star_frame, r, label, self.phys_star[key],
+                              self.phys_star[key + "_label"], lo, hi, step=step,
+                              on_change=self._on_phys_star_slider_change)
+            r += 2
+        ttk.Button(self._phys_star_frame, text="Reset this star's physical look",
+                   style="Warn.TButton", command=self._reset_selected_phys_override).grid(
+            row=r, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 4))
+
         self._spike_help_per_size = ("Each star's own diameter blends smoothly between the\n"
                        "Small/Medium/Large tabs above - stars below the Small\n"
                        "tab's diameter get no spike at all. Ctrl+Click a star in\n"
@@ -2424,13 +2489,13 @@ class App:
                        "or empty space / Deselect to stop editing a single star.")
         self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
         self._spike_help_label.grid(
-            row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+            row=14, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
         ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
                    command=self._reset_spike_edits).grid(
-            row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+            row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
         ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
                    command=self._reset_spike_defaults).grid(
-            row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+            row=16, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
         self._update_spike_mode_ui()
 
         # ---- Status bar ----
@@ -2953,25 +3018,35 @@ class App:
 
     def _update_spike_mode_ui(self):
         """Shows whichever of the notebook (per-size tabs) / flat uniform
-        panel / single-star panel applies right now, and swaps the matching
-        help text - only one of the three control sets is ever visible at
-        once. A star selection (Shift+Click) always wins over the Simple/
-        Per-size mode choice, which stays remembered underneath and
-        reappears as soon as the star is deselected."""
+        panel / single-star panel applies right now, for BOTH the classic set
+        and the physical set, and swaps the matching help text - only one of
+        the three control sets is ever visible at once. A star selection
+        (Shift+Click) always wins over the Simple/Per-size mode choice, which
+        stays remembered underneath and reappears as soon as the star is
+        deselected."""
         if self._selected_star_key is not None:
             self._spike_notebook.grid_remove()
             self._spike_uniform_frame.grid_remove()
             self._spike_star_frame.grid()
+            self._phys_notebook.grid_remove()
+            self._phys_uniform_frame.grid_remove()
+            self._phys_star_frame.grid()
             self._spike_help_label.config(text=self._spike_help_star)
         elif self.spike_mode.get() == "uniform":
             self._spike_notebook.grid_remove()
             self._spike_star_frame.grid_remove()
             self._spike_uniform_frame.grid()
+            self._phys_notebook.grid_remove()
+            self._phys_star_frame.grid_remove()
+            self._phys_uniform_frame.grid()
             self._spike_help_label.config(text=self._spike_help_uniform)
         else:
             self._spike_uniform_frame.grid_remove()
             self._spike_star_frame.grid_remove()
             self._spike_notebook.grid()
+            self._phys_uniform_frame.grid_remove()
+            self._phys_star_frame.grid_remove()
+            self._phys_notebook.grid()
             self._spike_help_label.config(text=self._spike_help_per_size)
 
     def _current_look_for_fwhm(self, fwhm):
