@@ -2005,6 +2005,32 @@ class App:
             self.spike_star[key + "_label"] = tk.StringVar(value=fmt.format(val))
         self.spike_star_info = tk.StringVar(value="")
 
+        # ---- Physical spikes (second layer) ----
+        pd = PHYS_DEFAULTS
+        self.phys_enabled = tk.BooleanVar(value=pd["enabled"])
+        self.phys_aperture = tk.StringVar(value=pd["aperture"])
+        self.phys_blades = tk.DoubleVar(value=float(pd["blades"]))
+        self.phys_rotation = tk.DoubleVar(value=pd["rotation"])
+        self.phys_fft_from = tk.DoubleVar(value=pd["fft_from"])
+        self.phys_blades_label = tk.StringVar(value=f"{pd['blades']:.0f}")
+        self.phys_rotation_label = tk.StringVar(value=f"{pd['rotation']:.0f}")
+        self.phys_fft_from_label = tk.StringVar(value=f"{pd['fft_from']:.0f}")
+
+        def _phys_vars(values):
+            out = {}
+            for key, _label, _lo, _hi, _step, fmt in PHYS_PARAM_DEFS:
+                out[key] = tk.DoubleVar(value=values[key])
+                out[key + "_label"] = tk.StringVar(value=fmt.format(values[key]))
+            return out
+
+        self.phys_anchors = [_phys_vars(a) for a in pd["anchors"]]
+        self.phys_uniform = _phys_vars(PHYS_UNIFORM_DEFAULTS)
+        self.phys_star = _phys_vars(PHYS_UNIFORM_DEFAULTS)
+        self._phys_star_overrides = {}     # same keys as _spike_star_overrides, independent values
+        self._phys_layer_preview = None
+        self._spike_layer_key = None       # cache keys: skip re-rendering a layer whose inputs did not change
+        self._phys_layer_key = None
+
         self._pristine_full = None  # (H,W,3) float [0,1], fetched once from Siril
         self._src_preview_rgb = None  # raw (H,W,3) preview, before adjustments
         self.loaded = False
@@ -2639,6 +2665,14 @@ class App:
             if key != "diam":
                 self.spike_uniform[key + "_label"].set(fmt.format(self.spike_uniform[key].get()))
                 self.spike_star[key + "_label"].set(fmt.format(self.spike_star[key].get()))
+        self.phys_blades_label.set(f"{self.phys_blades.get():.0f}")
+        self.phys_rotation_label.set(f"{self.phys_rotation.get():.0f}")
+        self.phys_fft_from_label.set(f"{self.phys_fft_from.get():.0f}")
+        for key, _label, _lo, _hi, _step, fmt in PHYS_PARAM_DEFS:
+            for av in self.phys_anchors:
+                av[key + "_label"].set(fmt.format(av[key].get()))
+            self.phys_uniform[key + "_label"].set(fmt.format(self.phys_uniform[key].get()))
+            self.phys_star[key + "_label"].set(fmt.format(self.phys_star[key].get()))
 
     def _on_tone_slider(self):
         """Light & Tones / Color & Hue sliders: cheap, so recompute and
@@ -2709,6 +2743,82 @@ class App:
             {"diam": min_d * SPIKE_UNIFORM_REF_MULT, **full},
         ]
 
+    def _phys_uniform_anchors(self):
+        """Simple mode for the physical set: depth and streaks scale from 0 at
+        the shared cutoff to their slider value at 4x the cutoff; everything
+        else is constant (see spec 4.2)."""
+        min_d = self.spike_uniform_min_diam.get()
+        full = {k: self.phys_uniform[k].get() for k in _PHYS_PARAM_KEYS}
+        zero = dict(full, **{k: 0.0 for k in PHYS_FADE_KEYS})
+        return [{"diam": min_d, **zero}, {"diam": min_d * SPIKE_UNIFORM_REF_MULT, **full}]
+
+    def _phys_config(self):
+        """The config object render_physical_layer takes."""
+        if self.spike_mode.get() == "uniform":
+            anchors = self._phys_uniform_anchors()
+        else:
+            anchors = [dict({k: av[k].get() for k in _PHYS_PARAM_KEYS}, diam=cav["diam"].get())
+                       for av, cav in zip(self.phys_anchors, self.spike_anchors)]
+        return {
+            "anchors": anchors,
+            "aperture": self.phys_aperture.get(),
+            "blades": int(round(self.phys_blades.get())),
+            "rotation": self.phys_rotation.get(),
+            "fft_from": self.phys_fft_from.get(),
+        }
+
+    def _effective_phys_stars(self):
+        """Same star selection as _effective_stars() (shared disable/force/
+        manual edits), with the physical set's own per-star overrides."""
+        out = []
+        for i, (x, y, fwhm, amp, color) in enumerate(self._stars):
+            if i in self._spike_disabled:
+                continue
+            out.append((x, y, fwhm, amp, color, i in self._spike_forced,
+                        self._phys_star_overrides.get(("auto", i))))
+        for (mid, x, y, fwhm, amp, color) in self._spike_manual:
+            out.append((x, y, fwhm, amp, color, True, self._phys_star_overrides.get(("manual", mid))))
+        return out
+
+    def _current_phys_look_for_fwhm(self, fwhm):
+        anchors = sorted(self._phys_config()["anchors"], key=lambda a: a["diam"])
+        return _interp_anchor_params(anchors, max(fwhm, anchors[0]["diam"]), _PHYS_PARAM_KEYS)
+
+    def _on_phys_star_slider_change(self):
+        """A physical star-panel slider moved: snapshot all physical values as
+        that star's physical override (independent from the classic one)."""
+        self._update_all_labels()
+        if self._selected_star_key is None:
+            return
+        self._phys_star_overrides[self._selected_star_key] = {
+            k: self.phys_star[k].get() for k in _PHYS_PARAM_KEYS}
+        if not self.loaded:
+            return
+        self._schedule_spike_preview()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
+
+    def _reset_selected_phys_override(self):
+        if self._selected_star_key is None:
+            return
+        had = self._phys_star_overrides.pop(self._selected_star_key, None) is not None
+        self._select_star(self._selected_star_key)
+        if had:
+            self._schedule_spike_preview()
+
+    def _reset_phys_defaults(self):
+        pd = PHYS_DEFAULTS
+        self.phys_enabled.set(pd["enabled"])
+        self.phys_aperture.set(pd["aperture"])
+        self.phys_blades.set(float(pd["blades"]))
+        self.phys_rotation.set(pd["rotation"])
+        self.phys_fft_from.set(pd["fft_from"])
+        for av, defaults in zip(self.phys_anchors, pd["anchors"]):
+            for k in _PHYS_PARAM_KEYS:
+                av[k].set(defaults[k])
+        for k in _PHYS_PARAM_KEYS:
+            self.phys_uniform[k].set(PHYS_UNIFORM_DEFAULTS[k])
+
     def _spike_min_diameter(self):
         """The current mode's cutoff diameter - below it a star gets no
         spike at all (see render_spike_layer)."""
@@ -2743,6 +2853,7 @@ class App:
         self._spike_forced.clear()
         self._spike_manual.clear()
         self._spike_star_overrides.clear()
+        self._phys_star_overrides.clear()
         self._deselect_star()
         if self.loaded:
             self._schedule_spike_preview()
@@ -2765,6 +2876,7 @@ class App:
         self.spike_uniform_min_diam.set(ud["min_diam"])
         for key in _ANCHOR_PARAM_KEYS:
             self.spike_uniform[key].set(ud[key])
+        self._reset_phys_defaults()
         self._on_spike_slider()
 
     def _on_spike_mode_change(self):
@@ -2902,6 +3014,10 @@ class App:
         values = override if override is not None else self._current_look_for_fwhm(fwhm)
         for k in _ANCHOR_PARAM_KEYS:
             self.spike_star[k].set(values[k])
+        pov = self._phys_star_overrides.get(key)
+        pvals = pov if pov is not None else self._current_phys_look_for_fwhm(fwhm)
+        for k in _PHYS_PARAM_KEYS:
+            self.phys_star[k].set(pvals[k])
         state = "custom look" if override is not None else "size-based look"
         self.spike_star_info.set(f"Editing star (fwhm ≈ {fwhm:.1f}px) - showing its {state}")
         self._update_all_labels()
@@ -2978,6 +3094,8 @@ class App:
         rgb = self._base_preview_rgb
         if self.spike_enabled.get() and self._spike_layer_preview is not None:
             rgb = apply_spikes(rgb, self._spike_layer_preview)
+        if self.phys_enabled.get() and self._phys_layer_preview is not None:
+            rgb = apply_spikes(rgb, self._phys_layer_preview)
         self._preview_rgb = rgb
 
     def _schedule_spike_preview(self):
@@ -3007,48 +3125,70 @@ class App:
             return
         self._spike_preview_gen += 1
         gen = self._spike_preview_gen
-
-        if not self.spike_enabled.get():
-            self._spike_layer_preview = None
-            self._compose_preview()
-            self._redraw_canvas()
-            return
-
-        stars = self._effective_stars()
-        if not stars:
-            self._spike_layer_preview = None
-            self._compose_preview()
-            self._redraw_canvas()
-            return
-
         ph, pw = self._base_preview_rgb.shape[:2]
         fh, fw = self.full_shape
-        params = self._spike_config()
-        ss = self._spike_supersample(ph, pw)
+
+        stars = self._effective_stars() if self.spike_enabled.get() else []
+        want_c = bool(stars)
+        if not want_c:
+            self._spike_layer_preview = None
+            self._spike_layer_key = None
+        pstars = self._effective_phys_stars() if self.phys_enabled.get() else []
+        want_p = bool(pstars)
+        if not want_p:
+            self._phys_layer_preview = None
+            self._phys_layer_key = None
+
+        params = self._spike_config() if want_c else None
+        ss = self._spike_supersample(ph, pw) if want_c else 1
+        pparams = self._phys_config() if want_p else None
+        # Each layer is re-rendered only when its own inputs changed.
+        ckey = repr((stars, params, ss, ph, pw)) if want_c else None
+        pkey = repr((pstars, pparams, ph, pw)) if want_p else None
+        need_c = want_c and ckey != self._spike_layer_key
+        need_p = want_p and pkey != self._phys_layer_key
+        if not (need_c or need_p):
+            self._compose_preview()
+            self._redraw_canvas()
+            return
         self._spike_preview_inflight = True
         self._busy_begin()
-        t = threading.Thread(target=self._spike_preview_thread,
-                              args=(gen, ph, pw, fh, fw, stars, params, ss), daemon=True)
+        t = threading.Thread(
+            target=self._spike_preview_thread,
+            args=(gen, ph, pw, fh, fw, stars, params, ss, pstars, pparams, need_c, need_p, ckey, pkey),
+            daemon=True)
         t.start()
 
-    def _spike_preview_thread(self, gen, ph, pw, fh, fw, stars, params, ss):
+    def _spike_preview_thread(self, gen, ph, pw, fh, fw, stars, params, ss,
+                              pstars, pparams, need_c, need_p, ckey, pkey):
         # Always post something, success or failure - _poll_queue's
         # "spike_preview" handler pairs every message here with the
         # _busy_begin() this thread's launch made, so the busy spinner
         # would otherwise spin forever after a failed render.
-        layer = None
+        layer = player = None
         try:
-            if ss > 1:
-                layer = render_spike_layer((ph * ss, pw * ss), 0, 0, fw, fh, stars, params)
-                layer = resize_layer(layer, pw, ph)
-            else:
-                layer = render_spike_layer((ph, pw), 0, 0, fw, fh, stars, params)
+            if need_c:
+                if ss > 1:
+                    layer = render_spike_layer((ph * ss, pw * ss), 0, 0, fw, fh, stars, params)
+                    layer = resize_layer(layer, pw, ph)
+                else:
+                    layer = render_spike_layer((ph, pw), 0, 0, fw, fh, stars, params)
         except Exception as e:
             try:
                 self.worker.log(f"frankSpikes: spike preview render failed: {e}")
             except Exception:
                 pass
-        self.queue.put(("spike_preview", (gen, layer)))
+        try:
+            if need_p:
+                player = render_physical_layer((ph, pw), 0, 0, fw, fh, pstars, pparams)
+        except Exception as e:
+            try:
+                self.worker.log(f"frankSpikes: physical spike preview render failed: {e}")
+            except Exception:
+                pass
+        self.queue.put(("spike_preview", (gen, layer, player,
+                                          ckey if layer is not None else None,
+                                          pkey if player is not None else None)))
 
     # ---------- Zoom / pan / canvas ----------
     # In "fit" mode the low-resolution raster is always shown (that's fine:
@@ -3399,7 +3539,8 @@ class App:
         self._hires_gen += 1
         gen = self._hires_gen
         vals = self._slider_values()
-        spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_config())
+        spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_config(),
+                       self.phys_enabled.get(), self._effective_phys_stars(), self._phys_config())
         full = self._pristine_full
         self._hires_inflight = True
         self._busy_begin()
@@ -3420,11 +3561,15 @@ class App:
             got_h, got_w = rgb.shape[:2]
 
             rgb = apply_cosmetics(rgb, *vals)
-            spike_enabled, stars, sparams = spike_state
+            spike_enabled, stars, sparams, phys_enabled, pstars, pparams = spike_state
             if spike_enabled and stars:
                 layer = render_spike_layer((got_h, got_w), req_x, req_y, req_w, req_h,
                                             stars, sparams)
                 rgb = apply_spikes(rgb, layer)
+            if phys_enabled and pstars:
+                player = render_physical_layer((got_h, got_w), req_x, req_y, req_w, req_h,
+                                               pstars, pparams)
+                rgb = apply_spikes(rgb, player)
             actual_wh = (got_w, got_h)
         except Exception as e:
             # This is only a high-res preview: on failure we just stay on the
@@ -3599,6 +3744,9 @@ class App:
             spike_enabled = self.spike_enabled.get()
             stars = self._effective_stars()
             sparams = self._spike_config()
+            phys_enabled = self.phys_enabled.get()
+            pstars = self._effective_phys_stars()
+            pparams = self._phys_config()
 
             if self._pristine_full is None:
                 raise RuntimeError("No image loaded from Siril yet.")
@@ -3618,6 +3766,12 @@ class App:
                 fh, fw = self.full_shape
                 layer = render_spike_layer((fh, fw), 0, 0, fw, fh, stars, sparams)
                 rgb_final = apply_spikes(rgb_final, layer)
+
+            if phys_enabled and pstars:
+                self.queue.put(("status", "Process: rendering physical spikes..."))
+                fh, fw = self.full_shape
+                player = render_physical_layer((fh, fw), 0, 0, fw, fh, pstars, pparams)
+                rgb_final = apply_spikes(rgb_final, player)
 
             self.queue.put(("status", "Process: applying to the active image in Siril..."))
             self.worker.push_rgb(rgb_final)
@@ -3644,6 +3798,7 @@ class App:
                     self._spike_manual = []
                     self._manual_id_counter = 0
                     self._spike_star_overrides = {}
+                    self._phys_star_overrides = {}
                     self._selected_star_key = None
                     self.loaded = True
                     self._siril_busy = False
@@ -3667,13 +3822,19 @@ class App:
                         self._hires_wh = actual_wh
                         self._redraw_canvas()
                 elif kind == "spike_preview":
-                    gen, layer = payload
+                    gen, layer, player, ckey, pkey = payload
                     self._spike_preview_inflight = False
                     self._busy_end()
-                    if layer is not None and gen == self._spike_preview_gen:
-                        self._spike_layer_preview = layer
-                        self._compose_preview()
-                        self._redraw_canvas()
+                    if gen == self._spike_preview_gen:
+                        if layer is not None:
+                            self._spike_layer_preview = layer
+                            self._spike_layer_key = ckey
+                        if player is not None:
+                            self._phys_layer_preview = player
+                            self._phys_layer_key = pkey
+                        if layer is not None or player is not None:
+                            self._compose_preview()
+                            self._redraw_canvas()
                 elif kind == "done":
                     self._busy_end()
                     self._siril_busy = False
