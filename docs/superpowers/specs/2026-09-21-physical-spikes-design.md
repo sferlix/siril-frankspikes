@@ -104,7 +104,7 @@ amplitude factor `1/s_c²`.
 
 ### 4.4 FFT branch (stars with fwhm ≥ `fft_from`)
 
-A polychromatic PSF template is computed once per parameter key and cached (LRU, 8 entries,
+A polychromatic PSF template is computed once per parameter key and cached (LRU, 4 entries,
 lock-protected): grid `N=1024`, pupil `D=64` px (λ/D = 16 px), 8 wavelengths 430–670 nm
 mapped through the dispersion (`λ_eff = 530 + d(λ−530)`), pupil scaled by `530/λ_eff`, RGB via
 Gaussian sensor responses (600/535/455 nm), soft-edged pupil (circle or n-gon, obstruction,
