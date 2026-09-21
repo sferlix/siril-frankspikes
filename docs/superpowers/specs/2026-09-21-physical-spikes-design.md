@@ -168,3 +168,27 @@ Budget: 1000 stars analytic ≤ ~3 s at full frame on the dev machine; FFT templ
 ## 9. Release
 
 Version 2.1.0, README section for the new set and tail slider, in-app Help text updated.
+
+## 10. Changes made during implementation (supersede the sections above)
+
+The first renders on a dense synthetic field were unusable (rainbow fog, no visible
+spikes), which changed the display model. Final behaviour:
+
+* **Display mapping (4.5):** `v = asinh(G·max(I·flux − F, 0)) / asinh(G)` with sky floor
+  `F = 2e-5` (relative to the star peak) and `G = 10^(6·depth/100)`. `rings` and `spikes`
+  are linear gains on the *mapped* value (the asinh is logarithmic, so a gain applied
+  before it barely changes what is seen). `flux = clamp(amp/max_amp, 0.03, 1)`, no size boost.
+* **Ring fade:** the ring term is multiplied by `exp(-(rho/9)^2)` (seeing/imperfections wash
+  out far rings). The analytic ring table is capped at 18 λ/D.
+* **Seeing softening (new global slider, default 1.0, 0–4, FWHM in λ/D):** Gaussian blur of
+  the FFT template and of the analytic ring table; widens analytic spikes
+  (`σ = sqrt(σ_q² + σ_s²)`, peak × `σ_q/σ`).
+* **FFT template:** the spike part is `max(I_full − I_ring_unfaded, 0)`, switched on beyond
+  2 λ/D and restricted to a ±2σ band around each spike axis (secondary lobes between the
+  spikes are dropped, as in the analytic branch); 12 wavelengths.
+* **Calibrated constants:** `PHYS_EDGE_KAPPA_EVEN = 0.39`, `PHYS_EDGE_KAPPA_ODD = 0.12`
+  (odd polygons run slightly bright far out in the analytic branch; the FFT branch is exact).
+* **Defaults:** depth 45/70/90 (Small/Medium/Large), Simple 85; rings 15/20/25 (Simple 20);
+  dispersion 60. Template LRU is 4 entries.
+* **Performance:** LUT-based analytic drawing; 300 stars at 1200×900 (all analytic,
+  including 22–40 px stars) ≈ 5 s.

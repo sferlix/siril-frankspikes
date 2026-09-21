@@ -65,6 +65,21 @@ Diffraction Spikes (panel to the right of the preview)
      ray, also layered on top of the star's own colour.
    - Color saturation (per anchor): 0 keeps that size of star's spike/flare
      pure white regardless of its own colour or the other color sliders.
+   - Soft flare tail length (per anchor): adds a long power-law tail to the
+     Soft flare glow, out to that many star diameters (0 = the original
+     gaussian-only glow, unchanged).
+   - Physical spikes (beta): a second layer, combined with the classic one,
+     built from aperture physics instead of an artistic ray. Tick "Enable
+     physical spikes" and adjust: Depth (its brightness), Spike extent,
+     Spike strength, Vane thickness (thinner = dimmer and longer spikes),
+     Ring strength, Central obstruction, Chromatic dispersion (colour from
+     wavelength), Star colour influence and Dust/scratch streaks. Aperture,
+     Blades (odd counts give twice as many spikes), Rotation and Seeing
+     softening are global. Small stars use a fast closed-form model, stars
+     above "Use FFT model from star diameter" a Fourier-optics PSF. It follows
+     the same Simple / Per size selector, and Shift+Click a star gives it its
+     own physical look. Off by default: with it off, and the tail at 0, the
+     result is identical to frankSpikes 2.0.
    - After generating, Ctrl+Click a star in the preview to remove/restore
      its spikes (this also lets you force a spike onto a star smaller than
      the Small anchor's diameter), or Ctrl+Click empty space to add one
@@ -113,7 +128,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import sirilpy as s
 from sirilpy import SirilConnectionError
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -253,17 +268,18 @@ PHYS_DEFAULTS = {
     "blades": 6,
     "rotation": 0.0,
     "fft_from": 15.0,
+    "seeing": 1.0,
     "anchors": [
-        {"depth": 70.0, "extent": 8.0, "spikes": 100.0, "vane": 1.0, "rings": 60.0,
-         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0, "streak_len": 6.0},
-        {"depth": 80.0, "extent": 14.0, "spikes": 100.0, "vane": 1.0, "rings": 80.0,
-         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0, "streak_len": 8.0},
-        {"depth": 85.0, "extent": 25.0, "spikes": 100.0, "vane": 1.0, "rings": 100.0,
-         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0, "streak_len": 10.0},
+        {"depth": 45.0, "extent": 8.0, "spikes": 100.0, "vane": 1.0, "rings": 15.0,
+         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0, "streak_len": 6.0},
+        {"depth": 70.0, "extent": 14.0, "spikes": 100.0, "vane": 1.0, "rings": 20.0,
+         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0, "streak_len": 8.0},
+        {"depth": 90.0, "extent": 25.0, "spikes": 100.0, "vane": 1.0, "rings": 25.0,
+         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0, "streak_len": 10.0},
     ],
 }
-PHYS_UNIFORM_DEFAULTS = {"depth": 80.0, "extent": 15.0, "spikes": 100.0, "vane": 1.0, "rings": 80.0,
-                         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0,
+PHYS_UNIFORM_DEFAULTS = {"depth": 85.0, "extent": 15.0, "spikes": 100.0, "vane": 1.0, "rings": 20.0,
+                         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0,
                          "streak_len": 8.0}
 # In Simple mode only these scale from 0 at the cutoff diameter to the slider value.
 PHYS_FADE_KEYS = ("depth", "streaks")
@@ -1348,7 +1364,7 @@ def _phys_mask(r, fwhm_px, extent_px):
 
 
 def _phys_display(I, G, norm):
-    return np.arcsinh(G * I) / norm
+    return np.arcsinh(G * np.maximum(I - PHYS_FLOOR, 0.0)) / norm
 
 
 def _phys_color_mult(p, star_color):
@@ -1368,17 +1384,40 @@ def _phys_strip_box(cx, cy, angle_deg, length, half_w, w, h):
 # Rings farther than this (in lambda/D) are dropped from the analytic branch; the
 # cost of a star grows with its square.
 PHYS_RING_MAX_LAMD = 18.0
+# Display gain G = 10^(PHYS_DEPTH_DECADES * depth / 100) of the asinh mapping.
+PHYS_DEPTH_DECADES = 6.0
+# Sky/noise floor relative to the star's peak: anything fainter than this is not
+# drawn, so the faint far tails of the rings do not fog the whole frame.
+PHYS_FLOOR = 2e-5
+# Seeing/optical imperfections wash out the fine ring structure far from the
+# star; the ring term is faded by exp(-(rho / this)^2) (rho in lambda/D). The
+# spikes are not affected.
+PHYS_RING_FADE_LAMD = 9.0
+
+
+def _phys_ring_fade(rho):
+    return np.exp(-(np.asarray(rho, dtype=np.float64) / PHYS_RING_FADE_LAMD) ** 2)
 _phys_airy_luts = {}
 
 
-def _phys_airy_lut(eps):
-    """1-D table of the obstructed Airy intensity (0..60 lambda/D), so the
-    per-pixel ring evaluation is one np.interp instead of two J1 polynomials."""
-    key = round(float(eps), 3)
+def _phys_airy_lut(eps, seeing=0.0):
+    """1-D table of the obstructed Airy intensity (0..60 lambda/D) times the
+    ring fade, smoothed by the seeing (Gaussian, FWHM `seeing` lambda/D), so the
+    per-pixel ring evaluation is one np.interp."""
+    key = (round(float(eps), 3), round(float(seeing), 2))
     lut = _phys_airy_luts.get(key)
     if lut is None:
-        rho = np.arange(0.0, 60.0, 0.005)
-        lut = (rho, _airy_obstructed_intensity(rho, key))
+        step = 0.005
+        rho = np.arange(0.0, 60.0, step)
+        I = _airy_obstructed_intensity(rho, key[0]) * _phys_ring_fade(rho)
+        if seeing > 0.0:
+            sig = seeing / 2.355 / step
+            half = int(4 * sig) + 1
+            k = np.exp(-0.5 * (np.arange(-half, half + 1) / sig) ** 2)
+            k /= k.sum()
+            ext = np.concatenate([I[1:half + 1][::-1], I, I[-half - 1:-1][::-1]])
+            I = np.convolve(ext, k, mode="valid")
+        lut = (rho, I)
         _phys_airy_luts[key] = lut
     return lut
 
@@ -1391,7 +1430,7 @@ def _phys_axes(x0, y0, x1, y1, lx, ly):
     return dx, dy
 
 
-def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, flux, blades=6):
+def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, flux, blades=6, seeing=0.0):
     """Closed-form rings + spikes of one star into canvas `cv` (pixel (i, j)
     of cv is layer pixel (oy + i, ox + j)); see spec 4.3."""
     if p["depth"] <= 0.0:
@@ -1400,7 +1439,7 @@ def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, fl
     eps = min(0.95, max(0.0, p["obstruction"] / 100.0))
     vane = max(p["vane"] / 100.0, 1e-4)
     scales = _phys_channel_scales(p["dispersion"])
-    G = 10.0 ** (6.0 * p["depth"] / 100.0)
+    G = 10.0 ** (PHYS_DEPTH_DECADES * p["depth"] / 100.0)
     norm = np.arcsinh(G)
     mult = _phys_color_mult(p, star_color)
     X = max(p["extent"] * fwhm_px, 1.0)
@@ -1415,12 +1454,12 @@ def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, fl
             dx, dy = _phys_axes(x0, y0, x1, y1, lx, ly)
             r = np.hypot(dx, dy)
             mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.8 * R) / (0.2 * R)))
-            lut_rho, lut_I = _phys_airy_lut(eps)
+            lut_rho, lut_I = _phys_airy_lut(eps, seeing)
             for c in range(3):
                 sc = scales[c]
                 I = np.interp(r / np.float32(u * sc), lut_rho, lut_I).astype(np.float32)
-                I *= np.float32(rings_gain / (sc * sc) * flux)
-                v = np.arcsinh(G * I) * np.float32(mult[c] / norm) * mask
+                I *= np.float32(flux / (sc * sc))
+                v = _phys_display(I, G, norm) * np.float32(rings_gain * mult[c]) * mask
                 sub = cv[y0:y1, x0:x1, c]
                 np.maximum(sub, v, out=sub)
 
@@ -1428,7 +1467,10 @@ def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, fl
         a_max = X / (u * min(scales)) + 1.0
         a_grid = np.linspace(0.0, a_max, int(a_max / 0.04) + 2)
         for ln in lines:
-            sigq = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
+            sigq0 = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
+            sig_s = seeing / 2.355
+            sigq = float(np.sqrt(sigq0 * sigq0 + sig_s * sig_s))
+            amp_seeing = sigq0 / sigq          # the seeing widens the spike and lowers its peak
             half_w = 4.5 * sigq * u * max(scales) + 1.0
             box = _phys_strip_box(lx, ly, ln["angle"], X, half_w, cw, ch)
             if box is None:
@@ -1446,8 +1488,8 @@ def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, fl
                 q = (dy * ca - dx * sa) * inv_uc
                 along = np.interp(a, a_grid, prof).astype(np.float32)
                 I = along * np.exp(q * q * np.float32(-0.5 / (sigq * sigq)))
-                I *= np.float32(spikes_gain / (sc * sc) * flux)
-                v = np.arcsinh(G * I) * np.float32(mult[c] / norm) * mask
+                I *= np.float32(flux * amp_seeing / (sc * sc))
+                v = _phys_display(I, G, norm) * np.float32(spikes_gain * mult[c]) * mask
                 sub = cv[y0:y1, x0:x1, c]
                 np.maximum(sub, v, out=sub)
 
@@ -1494,7 +1536,7 @@ def _phys_draw_streaks(cv, ox, oy, cx, cy, fwhm_px, u, p, star_color, flux, sx, 
 _PHYS_TPL_N = 1024
 _PHYS_TPL_D = 64.0
 _PHYS_TPL_LAMD = _PHYS_TPL_N / _PHYS_TPL_D          # template px per lambda/D at 530 nm
-_PHYS_TPL_LAMBDAS = np.linspace(430.0, 670.0, 8)
+_PHYS_TPL_LAMBDAS = np.linspace(430.0, 670.0, 12)
 _PHYS_TPL_MAX = 4
 _PHYS_TPL_LEVELS = 4
 _PHYS_SENSOR = ((600.0, 40.0), (535.0, 40.0), (455.0, 30.0))   # (centre, sigma) of R, G, B
@@ -1542,7 +1584,7 @@ def _phys_mips(a):
     return out
 
 
-def _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion):
+def _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion, seeing=0.0):
     N, D = _PHYS_TPL_N, _PHYS_TPL_D
     d = dispersion / 100.0
     lams = _PHYS_TPL_LAMBDAS if d > 0.0 else np.array([PHYS_LAMBDA_REF])
@@ -1563,21 +1605,52 @@ def _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispers
         for c in range(3):
             full[..., c] += wts[c, i] * I
             ring[..., c] += wts[c, i] * ir
+    if seeing > 0.0:
+        # Gaussian seeing in lambda/D units (channel independent), applied in Fourier space
+        sig = seeing / 2.355 * _PHYS_TPL_LAMD
+        ky = np.fft.fftfreq(N)[:, None]
+        kx = np.fft.rfftfreq(N)[None, :]
+        H = np.exp(-2.0 * (np.pi * sig) ** 2 * (kx * kx + ky * ky))
+        for arr in (full, ring):
+            for c in range(3):
+                arr[..., c] = np.fft.irfft2(np.fft.rfft2(arr[..., c]) * H, s=(N, N)).astype(np.float32)
+    # `ring` is still the plain (unfaded) Airy here, so subtracting it leaves only the
+    # vane/edge part in `spk`; the fade is applied to the ring part afterwards.
     spk = np.maximum(full - ring, 0.0)
+    rr = r / _PHYS_TPL_LAMD
+    # the Airy near field belongs to the rings: spikes switch on beyond ~2 lambda/D
+    spk *= _smoothstep_arr((rr - 2.0) / 4.0)[..., None].astype(np.float32)
+    # keep only a band (+-2 lateral sigma) around each spike axis: the secondary
+    # lobes between the spikes are washed out by the seeing (and absent from the
+    # analytic branch), while the colour fringes along the spikes survive
+    gx, gy = xx - N / 2.0, yy - N / 2.0
+    sig_s = seeing / 2.355
+    band = np.zeros((N, N), np.float32)
+    for ln in _phys_spike_lines(aperture, blades, rotation_deg):
+        sigq0 = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
+        sigq = float(np.sqrt(sigq0 ** 2 + sig_s ** 2)) * max(_phys_channel_scales(dispersion))
+        th = np.radians(ln["angle"])
+        a_ax = (gx * np.cos(th) + gy * np.sin(th)) / _PHYS_TPL_LAMD
+        q_ax = (-gx * np.sin(th) + gy * np.cos(th)) / _PHYS_TPL_LAMD
+        lane = np.exp(-(q_ax * q_ax) / (2.0 * (2.0 * sigq) ** 2)) * (a_ax > 0.0)
+        band = np.maximum(band, lane.astype(np.float32))
+    spk *= band[..., None]
+    ring *= _phys_ring_fade(rr)[..., None].astype(np.float32)
     return {"N": N, "ring": _phys_mips(ring), "spk": _phys_mips(spk)}
 
 
-def _phys_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion):
+def _phys_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion, seeing=0.0):
     """Polychromatic PSF template (ring part + spike part) for one aperture
     setup, cached (LRU, lock-protected). eps and vane_frac are fractions."""
     key = (aperture, int(blades) if aperture == "polygon" else 0, round(float(rotation_deg), 2),
-           round(float(eps), 3), round(float(vane_frac), 5), round(float(dispersion), 1))
+           round(float(eps), 3), round(float(vane_frac), 5), round(float(dispersion), 1),
+           round(float(seeing), 2))
     with _phys_tpl_lock:
         tpl = _phys_tpl_cache.get(key)
         if tpl is not None:
             _phys_tpl_cache.move_to_end(key)
             return tpl
-    tpl = _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion)
+    tpl = _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion, seeing)
     with _phys_tpl_lock:
         _phys_tpl_cache[key] = tpl
         while len(_phys_tpl_cache) > _PHYS_TPL_MAX:
@@ -1621,13 +1694,15 @@ def _phys_draw_fft(cv, ox, oy, cx, cy, fwhm_px, u, p, tpl, star_color, flux):
     fy = (dy / ratio + Nt / 2.0 + 0.5) / div - 0.5
     ring = _phys_bilinear(tpl["ring"][level], fx, fy)
     spk = _phys_bilinear(tpl["spk"][level], fx, fy)
-    I = (p["rings"] / 100.0 * ring + p["spikes"] / 100.0 * spk) * flux
-    G = 10.0 ** (6.0 * p["depth"] / 100.0)
+    rg, sg = p["rings"] / 100.0, p["spikes"] / 100.0
+    G = 10.0 ** (PHYS_DEPTH_DECADES * p["depth"] / 100.0)
     norm = np.arcsinh(G)
     mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.85 * R) / (0.15 * R)))
     mult = _phys_color_mult(p, star_color)
     for c in range(3):
-        v = (_phys_display(I[..., c], G, norm) * mask * mult[c]).astype(np.float32)
+        v = np.maximum(rg * _phys_display(ring[..., c] * flux, G, norm),
+                       sg * _phys_display(spk[..., c] * flux, G, norm))
+        v = (v * mask * mult[c]).astype(np.float32)
         sub = cv[y0:y1, x0:x1, c]
         np.maximum(sub, v, out=sub)
 
@@ -1642,7 +1717,7 @@ def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cf
     cfg: {"anchors": [dicts with "diam" + _PHYS_PARAM_KEYS], "aperture":
     "spider4"|"spider3"|"polygon", "blades": int, "rotation": deg,
     "fft_from": star diameter in px above which the FFT template is used
-    (>= 200 means never)}."""
+    (>= 200 means never), "seeing": Gaussian softening FWHM in lambda/D (0 = off)}."""
     out_h, out_w = out_shape
     layer = np.zeros((out_h, out_w, 3), dtype=np.float32)
     if not stars or view_w <= 0:
@@ -1655,6 +1730,7 @@ def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cf
     use_fft = fft_from < 200.0
     lo_t = fft_from / 1.6
     aperture, blades, rot = cfg["aperture"], int(cfg["blades"]), float(cfg["rotation"])
+    seeing = float(cfg.get("seeing", 0.0))
     lines = _phys_spike_lines(aperture, blades, rot)
 
     for (x, y, fwhm, amp, color, forced, override) in stars:
@@ -1673,7 +1749,7 @@ def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cf
         cx, cy = (x - view_x0) * scale, (y - view_y0) * scale
         fwhm_px = fwhm * scale
         u = fwhm_px / PHYS_FWHM_PER_LAMD
-        flux = min(1.0, max(0.03, amp / max_amp))
+        flux = sflux = min(1.0, max(0.03, amp / max_amp))
         color = tuple(color)
 
         if p["depth"] > 0.0:
@@ -1683,10 +1759,10 @@ def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cf
             else:
                 w_fft = 0.0
             if w_fft <= 0.0:
-                _phys_draw_analytic(layer, 0, 0, cx, cy, fwhm_px, u, p, lines, color, flux, blades)
+                _phys_draw_analytic(layer, 0, 0, cx, cy, fwhm_px, u, p, lines, color, flux, blades, seeing)
             else:
                 tpl = _phys_template(aperture, blades, rot, p["obstruction"] / 100.0,
-                                     p["vane"] / 100.0, p["dispersion"])
+                                     p["vane"] / 100.0, p["dispersion"], seeing)
                 if w_fft >= 1.0:
                     _phys_draw_fft(layer, 0, 0, cx, cy, fwhm_px, u, p, tpl, color, flux)
                 else:
@@ -1696,13 +1772,13 @@ def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cf
                         bx0, by0, bx1, by1 = box
                         ca = np.zeros((by1 - by0, bx1 - bx0, 3), np.float32)
                         cf = np.zeros_like(ca)
-                        _phys_draw_analytic(ca, bx0, by0, cx, cy, fwhm_px, u, p, lines, color, flux, blades)
+                        _phys_draw_analytic(ca, bx0, by0, cx, cy, fwhm_px, u, p, lines, color, flux, blades, seeing)
                         _phys_draw_fft(cf, bx0, by0, cx, cy, fwhm_px, u, p, tpl, color, flux)
                         sub = layer[by0:by1, bx0:bx1]
                         np.maximum(sub, w_fft * cf + (1.0 - w_fft) * ca, out=sub)
 
         if p["streaks"] > 0.0:
-            _phys_draw_streaks(layer, 0, 0, cx, cy, fwhm_px, u, p, color, flux, x, y)
+            _phys_draw_streaks(layer, 0, 0, cx, cy, fwhm_px, u, p, color, sflux, x, y)
 
     return np.clip(layer, 0.0, 1.0)
 
@@ -2012,6 +2088,8 @@ class App:
         self.phys_blades = tk.DoubleVar(value=float(pd["blades"]))
         self.phys_rotation = tk.DoubleVar(value=pd["rotation"])
         self.phys_fft_from = tk.DoubleVar(value=pd["fft_from"])
+        self.phys_seeing = tk.DoubleVar(value=pd["seeing"])
+        self.phys_seeing_label = tk.StringVar(value=f"{pd['seeing']:.1f}")
         self.phys_blades_label = tk.StringVar(value=f"{pd['blades']:.0f}")
         self.phys_rotation_label = tk.StringVar(value=f"{pd['rotation']:.0f}")
         self.phys_fft_from_label = tk.StringVar(value=f"{pd['fft_from']:.0f}")
@@ -2432,8 +2510,12 @@ class App:
                           self.phys_fft_from, self.phys_fft_from_label, 3, 200, step=1,
                           on_change=self._on_spike_slider)
 
+        self._add_slider(frm_phys, 9, "Seeing softening (FWHM in lambda/D; 0 = razor sharp)",
+                          self.phys_seeing, self.phys_seeing_label, 0, 4, step=0.1,
+                          on_change=self._on_spike_slider)
+
         self._phys_notebook = ttk.Notebook(frm_phys)
-        self._phys_notebook.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
+        self._phys_notebook.grid(row=11, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
         for tab_label, av in zip(PHYS_TAB_LABELS, self.phys_anchors):
             tab = ttk.Frame(self._phys_notebook, style="Card.TFrame")
             tab.grid_columnconfigure(0, minsize=200)
@@ -2445,7 +2527,7 @@ class App:
                 r += 2
 
         self._phys_uniform_frame = ttk.Frame(frm_phys, style="Card.TFrame")
-        self._phys_uniform_frame.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
+        self._phys_uniform_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
         self._phys_uniform_frame.grid_columnconfigure(0, minsize=200)
         r = 0
         for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
@@ -2455,7 +2537,7 @@ class App:
             r += 2
 
         self._phys_star_frame = ttk.Frame(frm_phys, style="Card.TFrame")
-        self._phys_star_frame.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
+        self._phys_star_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
         self._phys_star_frame.grid_columnconfigure(0, minsize=200)
         ttk.Label(self._phys_star_frame, text="Physical look of the selected star",
                   style="Card.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 2))
@@ -2733,6 +2815,7 @@ class App:
         self.phys_blades_label.set(f"{self.phys_blades.get():.0f}")
         self.phys_rotation_label.set(f"{self.phys_rotation.get():.0f}")
         self.phys_fft_from_label.set(f"{self.phys_fft_from.get():.0f}")
+        self.phys_seeing_label.set(f"{self.phys_seeing.get():.1f}")
         for key, _label, _lo, _hi, _step, fmt in PHYS_PARAM_DEFS:
             for av in self.phys_anchors:
                 av[key + "_label"].set(fmt.format(av[key].get()))
@@ -2830,6 +2913,7 @@ class App:
             "blades": int(round(self.phys_blades.get())),
             "rotation": self.phys_rotation.get(),
             "fft_from": self.phys_fft_from.get(),
+            "seeing": self.phys_seeing.get(),
         }
 
     def _effective_phys_stars(self):
@@ -2878,6 +2962,7 @@ class App:
         self.phys_blades.set(float(pd["blades"]))
         self.phys_rotation.set(pd["rotation"])
         self.phys_fft_from.set(pd["fft_from"])
+        self.phys_seeing.set(pd["seeing"])
         for av, defaults in zip(self.phys_anchors, pd["anchors"]):
             for k in _PHYS_PARAM_KEYS:
                 av[k].set(defaults[k])
