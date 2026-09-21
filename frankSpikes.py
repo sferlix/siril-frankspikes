@@ -232,6 +232,42 @@ SPIKE_UNIFORM_DEFAULTS = {
     "rainbow": 0.0, "saturation": 25.0,
 }
 
+# Physical spikes (second layer): one row per size-dependent parameter.
+PHYS_PARAM_DEFS = [
+    ("depth",       "Depth (brightness of the layer)",      0,   100, 5,   "{:.0f}"),
+    ("extent",      "Spike extent (x star diameter)",       1,   60,  1,   "{:.0f}x"),
+    ("spikes",      "Spike strength",                       0,   200, 5,   "{:.0f}"),
+    ("vane",        "Vane thickness (% of aperture)",       0.2, 5,   0.1, "{:.1f}"),
+    ("rings",       "Ring strength",                        0,   200, 5,   "{:.0f}"),
+    ("obstruction", "Central obstruction (%)",              0,   60,  1,   "{:.0f}"),
+    ("dispersion",  "Chromatic dispersion",                 0,   200, 5,   "{:.0f}"),
+    ("color",       "Star colour influence",                0,   100, 5,   "{:.0f}"),
+    ("streaks",     "Dust/scratch streaks (amount)",        0,   100, 5,   "{:.0f}"),
+    ("streak_len",  "Streak length (x star diameter)",      1,   30,  1,   "{:.0f}x"),
+]
+_PHYS_PARAM_KEYS = tuple(k for k, *_ in PHYS_PARAM_DEFS)
+PHYS_TAB_LABELS = SPIKE_ANCHOR_TAB_LABELS
+PHYS_DEFAULTS = {
+    "enabled": False,
+    "aperture": "spider4",
+    "blades": 6,
+    "rotation": 0.0,
+    "fft_from": 15.0,
+    "anchors": [
+        {"depth": 70.0, "extent": 8.0, "spikes": 100.0, "vane": 1.0, "rings": 60.0,
+         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0, "streak_len": 6.0},
+        {"depth": 80.0, "extent": 14.0, "spikes": 100.0, "vane": 1.0, "rings": 80.0,
+         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0, "streak_len": 8.0},
+        {"depth": 85.0, "extent": 25.0, "spikes": 100.0, "vane": 1.0, "rings": 100.0,
+         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0, "streak_len": 10.0},
+    ],
+}
+PHYS_UNIFORM_DEFAULTS = {"depth": 80.0, "extent": 15.0, "spikes": 100.0, "vane": 1.0, "rings": 80.0,
+                         "obstruction": 30.0, "dispersion": 100.0, "color": 60.0, "streaks": 0.0,
+                         "streak_len": 8.0}
+# In Simple mode only these scale from 0 at the cutoff diameter to the slider value.
+PHYS_FADE_KEYS = ("depth", "streaks")
+
 PALETTE = {
     "bg": "#0e1117",
     "panel": "#161a23",
@@ -1329,6 +1365,32 @@ def _phys_strip_box(cx, cy, angle_deg, length, half_w, w, h):
     return _phys_clip_box(min(xs), min(ys), max(xs), max(ys), w, h)
 
 
+# Rings farther than this (in lambda/D) are dropped from the analytic branch; the
+# cost of a star grows with its square.
+PHYS_RING_MAX_LAMD = 18.0
+_phys_airy_luts = {}
+
+
+def _phys_airy_lut(eps):
+    """1-D table of the obstructed Airy intensity (0..60 lambda/D), so the
+    per-pixel ring evaluation is one np.interp instead of two J1 polynomials."""
+    key = round(float(eps), 3)
+    lut = _phys_airy_luts.get(key)
+    if lut is None:
+        rho = np.arange(0.0, 60.0, 0.005)
+        lut = (rho, _airy_obstructed_intensity(rho, key))
+        _phys_airy_luts[key] = lut
+    return lut
+
+
+def _phys_axes(x0, y0, x1, y1, lx, ly):
+    """Broadcast offsets from the star centre for the box [x0,x1) x [y0,y1):
+    dx has shape (1, w), dy shape (h, 1), both float32."""
+    dx = (np.arange(x0, x1, dtype=np.float32) - np.float32(lx))[None, :]
+    dy = (np.arange(y0, y1, dtype=np.float32) - np.float32(ly))[:, None]
+    return dx, dy
+
+
 def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, flux, blades=6):
     """Closed-form rings + spikes of one star into canvas `cv` (pixel (i, j)
     of cv is layer pixel (oy + i, ox + j)); see spec 4.3."""
@@ -1346,21 +1408,25 @@ def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, fl
     lx, ly = cx - ox, cy - oy
 
     if rings_gain > 0.0:
-        R = min(X, 24.0 * u * max(scales))
+        R = min(X, PHYS_RING_MAX_LAMD * u * max(scales))
         box = _phys_clip_box(lx - R, ly - R, lx + R, ly + R, cw, ch)
         if box is not None:
             x0, y0, x1, y1 = box
-            yy, xx = np.mgrid[y0:y1, x0:x1]
-            r = np.hypot(xx - lx, yy - ly)
+            dx, dy = _phys_axes(x0, y0, x1, y1, lx, ly)
+            r = np.hypot(dx, dy)
             mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.8 * R) / (0.2 * R)))
+            lut_rho, lut_I = _phys_airy_lut(eps)
             for c in range(3):
                 sc = scales[c]
-                I = rings_gain * _airy_obstructed_intensity(r / (u * sc), eps) / (sc * sc) * flux
-                v = _phys_display(I, G, norm) * mask * mult[c]
+                I = np.interp(r / np.float32(u * sc), lut_rho, lut_I).astype(np.float32)
+                I *= np.float32(rings_gain / (sc * sc) * flux)
+                v = np.arcsinh(G * I) * np.float32(mult[c] / norm) * mask
                 sub = cv[y0:y1, x0:x1, c]
-                np.maximum(sub, v.astype(np.float32), out=sub)
+                np.maximum(sub, v, out=sub)
 
     if spikes_gain > 0.0:
+        a_max = X / (u * min(scales)) + 1.0
+        a_grid = np.linspace(0.0, a_max, int(a_max / 0.04) + 2)
         for ln in lines:
             sigq = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
             half_w = 4.5 * sigq * u * max(scales) + 1.0
@@ -1368,22 +1434,22 @@ def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, fl
             if box is None:
                 continue
             x0, y0, x1, y1 = box
-            yy, xx = np.mgrid[y0:y1, x0:x1]
-            dx, dy = xx - lx, yy - ly
-            r = np.hypot(dx, dy)
-            mask = _phys_mask(r, fwhm_px, X)
+            dx, dy = _phys_axes(x0, y0, x1, y1, lx, ly)
+            mask = _phys_mask(np.hypot(dx, dy), fwhm_px, X)
             th = np.radians(ln["angle"])
-            ca, sa = np.cos(th), np.sin(th)
+            ca, sa = np.float32(np.cos(th)), np.float32(np.sin(th))
+            prof = _phys_spike_along(a_grid, ln, eps, vane)
             for c in range(3):
                 sc = scales[c]
-                uc = u * sc
-                a = (dx * ca + dy * sa) / uc
-                q = (-dx * sa + dy * ca) / uc
-                along = _phys_spike_along(np.maximum(a, 0.0), ln, eps, vane) * (a > 0.0)
-                I = spikes_gain * along * np.exp(-(q * q) / (2.0 * sigq * sigq)) / (sc * sc) * flux
-                v = _phys_display(I, G, norm) * mask * mult[c]
+                inv_uc = np.float32(1.0 / (u * sc))
+                a = (dx * ca + dy * sa) * inv_uc
+                q = (dy * ca - dx * sa) * inv_uc
+                along = np.interp(a, a_grid, prof).astype(np.float32)
+                I = along * np.exp(q * q * np.float32(-0.5 / (sigq * sigq)))
+                I *= np.float32(spikes_gain / (sc * sc) * flux)
+                v = np.arcsinh(G * I) * np.float32(mult[c] / norm) * mask
                 sub = cv[y0:y1, x0:x1, c]
-                np.maximum(sub, v.astype(np.float32), out=sub)
+                np.maximum(sub, v, out=sub)
 
 
 def _phys_hash01(x, y, i, salt):
@@ -1564,6 +1630,81 @@ def _phys_draw_fft(cv, ox, oy, cx, cy, fwhm_px, u, p, tpl, star_color, flux):
         v = (_phys_display(I[..., c], G, norm) * mask * mult[c]).astype(np.float32)
         sub = cv[y0:y1, x0:x1, c]
         np.maximum(sub, v, out=sub)
+
+
+def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
+    """Physical spike layer (rings, spikes, streaks) for a window of the
+    full-resolution image, scaled to out_shape=(out_h, out_w). Same star
+    tuples and the same size-class/cutoff logic as render_spike_layer; small
+    stars use the closed-form model, large ones the FFT template, with a
+    log-diameter cross-fade in between (see the design spec).
+
+    cfg: {"anchors": [dicts with "diam" + _PHYS_PARAM_KEYS], "aperture":
+    "spider4"|"spider3"|"polygon", "blades": int, "rotation": deg,
+    "fft_from": star diameter in px above which the FFT template is used
+    (>= 200 means never)}."""
+    out_h, out_w = out_shape
+    layer = np.zeros((out_h, out_w, 3), dtype=np.float32)
+    if not stars or view_w <= 0:
+        return layer
+    anchors_sorted = sorted(cfg["anchors"], key=lambda a: a["diam"])
+    min_diameter = anchors_sorted[0]["diam"]
+    scale = out_w / float(view_w)
+    max_amp = max((s[3] for s in stars), default=1.0) or 1.0
+    fft_from = float(cfg.get("fft_from", 15.0))
+    use_fft = fft_from < 200.0
+    lo_t = fft_from / 1.6
+    aperture, blades, rot = cfg["aperture"], int(cfg["blades"]), float(cfg["rotation"])
+    lines = _phys_spike_lines(aperture, blades, rot)
+
+    for (x, y, fwhm, amp, color, forced, override) in stars:
+        if override is not None:
+            p = override
+        elif fwhm < min_diameter and not forced:
+            continue
+        else:
+            p = _interp_anchor_params(anchors_sorted, max(fwhm, min_diameter), _PHYS_PARAM_KEYS)
+        if p["depth"] <= 0.0 and p["streaks"] <= 0.0:
+            continue
+        margin = fwhm * max(p["extent"], p["streak_len"], 6.0) + fwhm
+        if not (view_x0 - margin <= x <= view_x0 + view_w + margin and
+                view_y0 - margin <= y <= view_y0 + view_h + margin):
+            continue
+        cx, cy = (x - view_x0) * scale, (y - view_y0) * scale
+        fwhm_px = fwhm * scale
+        u = fwhm_px / PHYS_FWHM_PER_LAMD
+        flux = min(1.0, max(0.03, amp / max_amp))
+        color = tuple(color)
+
+        if p["depth"] > 0.0:
+            if use_fft and fwhm >= lo_t:
+                w_fft = 1.0 if fwhm >= fft_from else float(_smoothstep_arr(
+                    (np.log(fwhm) - np.log(lo_t)) / (np.log(fft_from) - np.log(lo_t))))
+            else:
+                w_fft = 0.0
+            if w_fft <= 0.0:
+                _phys_draw_analytic(layer, 0, 0, cx, cy, fwhm_px, u, p, lines, color, flux, blades)
+            else:
+                tpl = _phys_template(aperture, blades, rot, p["obstruction"] / 100.0,
+                                     p["vane"] / 100.0, p["dispersion"])
+                if w_fft >= 1.0:
+                    _phys_draw_fft(layer, 0, 0, cx, cy, fwhm_px, u, p, tpl, color, flux)
+                else:
+                    R = max(p["extent"] * fwhm_px, 1.0) + 2.0
+                    box = _phys_clip_box(cx - R, cy - R, cx + R, cy + R, out_w, out_h)
+                    if box is not None:
+                        bx0, by0, bx1, by1 = box
+                        ca = np.zeros((by1 - by0, bx1 - bx0, 3), np.float32)
+                        cf = np.zeros_like(ca)
+                        _phys_draw_analytic(ca, bx0, by0, cx, cy, fwhm_px, u, p, lines, color, flux, blades)
+                        _phys_draw_fft(cf, bx0, by0, cx, cy, fwhm_px, u, p, tpl, color, flux)
+                        sub = layer[by0:by1, bx0:bx1]
+                        np.maximum(sub, w_fft * cf + (1.0 - w_fft) * ca, out=sub)
+
+        if p["streaks"] > 0.0:
+            _phys_draw_streaks(layer, 0, 0, cx, cy, fwhm_px, u, p, color, flux, x, y)
+
+    return np.clip(layer, 0.0, 1.0)
 
 
 class SirilWorker:
