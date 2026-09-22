@@ -68,18 +68,6 @@ Diffraction Spikes (panel to the right of the preview)
    - Soft flare tail length (per anchor): adds a long power-law tail to the
      Soft flare glow, out to that many star diameters (0 = the original
      gaussian-only glow, unchanged).
-   - Physical spikes (beta): a second layer, combined with the classic one,
-     built from aperture physics instead of an artistic ray. Tick "Enable
-     physical spikes" and adjust: Depth (its brightness), Spike extent,
-     Spike strength, Vane thickness (thinner = dimmer and longer spikes),
-     Ring strength, Central obstruction, Chromatic dispersion (colour from
-     wavelength), Star colour influence and Dust/scratch streaks. Aperture,
-     Blades (odd counts give twice as many spikes), Rotation and Seeing
-     softening are global. Small stars use a fast closed-form model, stars
-     above "Use FFT model from star diameter" a Fourier-optics PSF. It follows
-     the same Simple / Per size selector, and Shift+Click a star gives it its
-     own physical look. Off by default: with it off, and the tail at 0, the
-     result is identical to frankSpikes 2.0.
    - After generating, Ctrl+Click a star in the preview to remove/restore
      its spikes (this also lets you force a spike onto a star smaller than
      the Small anchor's diameter), or Ctrl+Click empty space to add one
@@ -114,7 +102,6 @@ HOW TO USE IT
 import os
 import sys
 import math
-import collections
 import threading
 import queue
 import traceback
@@ -246,43 +233,6 @@ SPIKE_UNIFORM_DEFAULTS = {
     "soft_flare": 15.0, "flare_tail": 0.0, "ring_flare": 5.0, "chroma": 15.0,
     "rainbow": 0.0, "saturation": 25.0,
 }
-
-# Physical spikes (second layer): one row per size-dependent parameter.
-PHYS_PARAM_DEFS = [
-    ("depth",       "Depth (brightness of the layer)",      0,   100, 5,   "{:.0f}"),
-    ("extent",      "Spike extent (x star diameter)",       1,   60,  1,   "{:.0f}x"),
-    ("spikes",      "Spike strength",                       0,   200, 5,   "{:.0f}"),
-    ("vane",        "Vane thickness (% of aperture)",       0.2, 5,   0.1, "{:.1f}"),
-    ("rings",       "Ring strength",                        0,   200, 5,   "{:.0f}"),
-    ("obstruction", "Central obstruction (%)",              0,   60,  1,   "{:.0f}"),
-    ("dispersion",  "Chromatic dispersion",                 0,   200, 5,   "{:.0f}"),
-    ("color",       "Star colour influence",                0,   100, 5,   "{:.0f}"),
-    ("streaks",     "Dust/scratch streaks (amount)",        0,   100, 5,   "{:.0f}"),
-    ("streak_len",  "Streak length (x star diameter)",      1,   30,  1,   "{:.0f}x"),
-]
-_PHYS_PARAM_KEYS = tuple(k for k, *_ in PHYS_PARAM_DEFS)
-PHYS_TAB_LABELS = SPIKE_ANCHOR_TAB_LABELS
-PHYS_DEFAULTS = {
-    "enabled": False,
-    "aperture": "spider4",
-    "blades": 6,
-    "rotation": 0.0,
-    "fft_from": 15.0,
-    "seeing": 1.0,
-    "anchors": [
-        {"depth": 45.0, "extent": 8.0, "spikes": 100.0, "vane": 1.0, "rings": 15.0,
-         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0, "streak_len": 6.0},
-        {"depth": 70.0, "extent": 14.0, "spikes": 100.0, "vane": 1.0, "rings": 20.0,
-         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0, "streak_len": 8.0},
-        {"depth": 90.0, "extent": 25.0, "spikes": 100.0, "vane": 1.0, "rings": 25.0,
-         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0, "streak_len": 10.0},
-    ],
-}
-PHYS_UNIFORM_DEFAULTS = {"depth": 85.0, "extent": 15.0, "spikes": 100.0, "vane": 1.0, "rings": 20.0,
-                         "obstruction": 30.0, "dispersion": 60.0, "color": 60.0, "streaks": 0.0,
-                         "streak_len": 8.0}
-# In Simple mode only these scale from 0 at the cutoff diameter to the slider value.
-PHYS_FADE_KEYS = ("depth", "streaks")
 
 PALETTE = {
     "bg": "#0e1117",
@@ -1256,544 +1206,6 @@ def apply_spikes(rgb, layer):
     return np.clip(out, 0.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Physical spikes (second layer; see docs/superpowers/specs/2026-09-21-physical-spikes-design.md)
-# ---------------------------------------------------------------------------
-PHYS_LAMBDA_REF = 530.0
-PHYS_LAMBDA_RGB = (600.0, 530.0, 450.0)
-PHYS_FWHM_PER_LAMD = 1.03     # Airy core FWHM in units of lambda/D
-
-
-def _smoothstep_arr(t):
-    t = np.clip(t, 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
-
-
-def _bessel_j1(x):
-    """Bessel J1 with the Abramowitz & Stegun 9.4.4 / 9.4.6 polynomials (numpy
-    only, so no scipy dependency inside Siril's Python)."""
-    x = np.asarray(x, dtype=np.float64)
-    ax = np.abs(x)
-    out = np.empty_like(ax)
-    small = ax <= 3.0
-    t = (ax[small] / 3.0) ** 2
-    out[small] = ax[small] * (0.5 + t * (-0.56249985 + t * (0.21093573 + t * (
-        -0.03954289 + t * (0.00443319 + t * (-0.00031761 + t * 0.00001109))))))
-    big = ~small
-    xb = ax[big]
-    y = 3.0 / xb
-    f1 = 0.79788456 + y * (0.00000156 + y * (0.01659667 + y * (0.00017105 + y * (
-        -0.00249511 + y * (0.00113653 + y * -0.00020033)))))
-    th = xb - 2.35619449 + y * (0.12499612 + y * (0.00005650 + y * (-0.00637879 + y * (
-        0.00074348 + y * (0.00079824 + y * -0.00029166)))))
-    out[big] = f1 * np.cos(th) / np.sqrt(xb)
-    return np.sign(x) * out
-
-
-def _airy_obstructed_intensity(rho, eps):
-    """Airy pattern intensity (peak 1) of a circular aperture with central
-    obstruction ratio `eps`, at radius `rho` in lambda/D units."""
-    x = np.maximum(np.pi * np.asarray(rho, dtype=np.float64), 1e-9)
-    a = 2.0 * _bessel_j1(x) / x
-    if eps > 0.0:
-        b = 2.0 * _bessel_j1(eps * x) / (eps * x)
-        a = (a - eps * eps * b) / (1.0 - eps * eps)
-    return a * a
-
-
-def _phys_channel_scales(dispersion):
-    """Per-channel (R,G,B) scale of the diffraction pattern: proportional to
-    wavelength, blended toward 1 by dispersion (100 = physical)."""
-    d = dispersion / 100.0
-    return [1.0 + d * (lam / PHYS_LAMBDA_REF - 1.0) for lam in PHYS_LAMBDA_RGB]
-
-
-# Edge-diffraction gain constants for polygon apertures, calibrated against the
-# FFT template (tests/test_phys_fft.py). Measured FFT/model ratios at kappa=1:
-# even n (6, 8) 0.29-0.55; odd n (5, 7) 0.08-0.17 and falling with distance, so
-# the analytic odd-blade spikes run a little bright far out (the FFT branch used
-# for large stars is exact).
-PHYS_EDGE_KAPPA_EVEN = 0.39
-PHYS_EDGE_KAPPA_ODD = 0.12
-PHYS_VANE_LAT = 0.376         # sigma of the lateral profile per unit (D / vane length)
-
-
-def _phys_spike_lines(aperture, blades, rotation_deg):
-    """Half-rays of the diffraction pattern as dicts: angle (deg, image
-    coordinates), kind ("vane"|"edge"), gain (intensity multiplier), lat
-    (lateral sigma in lambda/D before the obstruction correction)."""
-    rot = float(rotation_deg)
-    lines = []
-    if aperture == "spider4":
-        for k in range(4):
-            lines.append({"angle": rot + 90.0 * k, "kind": "vane", "gain": 1.0, "lat": PHYS_VANE_LAT})
-    elif aperture == "spider3":
-        for k in range(6):
-            lines.append({"angle": rot + 60.0 * k, "kind": "vane", "gain": 0.25, "lat": 2.0 * PHYS_VANE_LAT})
-    else:
-        n = int(blades)
-        edge = np.sin(np.pi / n)
-        area = (n / 8.0) * np.sin(2.0 * np.pi / n)
-        kappa = PHYS_EDGE_KAPPA_ODD if n % 2 else PHYS_EDGE_KAPPA_EVEN
-        gain = kappa * (edge / area) ** 2
-        for k in range(n):
-            ang = rot + 90.0 + 360.0 * k / n
-            lines.append({"angle": ang, "kind": "edge", "gain": gain, "lat": PHYS_VANE_LAT / edge})
-            if n % 2:
-                lines.append({"angle": ang + 180.0, "kind": "edge", "gain": gain, "lat": PHYS_VANE_LAT / edge})
-    return lines
-
-
-def _phys_spike_along(a, ln, eps, vane_frac):
-    """Intensity (relative to the star's peak) along a spike at distance `a`
-    (lambda/D units, >= 0): vane plateau P/(1+(a/a_w)^2) or edge K/(pi a)^2,
-    switched on beyond the Airy near field."""
-    turn_on = _smoothstep_arr((a - 1.0) / 2.0)
-    if ln["kind"] == "vane":
-        plateau = (4.0 * vane_frac / (np.pi * (1.0 + eps))) ** 2 * ln["gain"]
-        a_w = 1.0 / (np.pi * vane_frac)
-        prof = plateau / (1.0 + (a / a_w) ** 2)
-    else:
-        prof = ln["gain"] / (np.pi * np.maximum(a, 1e-3)) ** 2
-    return prof * turn_on
-
-
-def _phys_clip_box(x0, y0, x1, y1, w, h):
-    ix0, iy0 = int(max(0, np.floor(x0))), int(max(0, np.floor(y0)))
-    ix1, iy1 = int(min(w, np.ceil(x1) + 1)), int(min(h, np.ceil(y1) + 1))
-    if ix1 <= ix0 or iy1 <= iy0:
-        return None
-    return ix0, iy0, ix1, iy1
-
-
-def _phys_mask(r, fwhm_px, extent_px):
-    """Core exclusion (the star already has its own core) times a smooth fade
-    to zero at the spike extent."""
-    core = _smoothstep_arr((r - 0.5 * fwhm_px) / (0.6 * fwhm_px))
-    ext = 1.0 - _smoothstep_arr((r - 0.75 * extent_px) / (0.25 * extent_px))
-    return core * ext
-
-
-def _phys_display(I, G, norm):
-    return np.arcsinh(G * np.maximum(I - PHYS_FLOOR, 0.0)) / norm
-
-
-def _phys_color_mult(p, star_color):
-    k = min(1.0, max(0.0, p["color"] / 100.0))
-    return [(1.0 - k) + k * float(star_color[c]) for c in range(3)]
-
-
-def _phys_strip_box(cx, cy, angle_deg, length, half_w, w, h):
-    th = np.radians(angle_deg)
-    c, s = np.cos(th), np.sin(th)
-    nx, ny = -s * half_w, c * half_w
-    xs = (cx + nx, cx - nx, cx + c * length + nx, cx + c * length - nx)
-    ys = (cy + ny, cy - ny, cy + s * length + ny, cy + s * length - ny)
-    return _phys_clip_box(min(xs), min(ys), max(xs), max(ys), w, h)
-
-
-# Rings farther than this (in lambda/D) are dropped from the analytic branch; the
-# cost of a star grows with its square.
-PHYS_RING_MAX_LAMD = 18.0
-# Display gain G = 10^(PHYS_DEPTH_DECADES * depth / 100) of the asinh mapping.
-PHYS_DEPTH_DECADES = 6.0
-# Sky/noise floor relative to the star's peak: anything fainter than this is not
-# drawn, so the faint far tails of the rings do not fog the whole frame.
-PHYS_FLOOR = 2e-5
-# Seeing/optical imperfections wash out the fine ring structure far from the
-# star; the ring term is faded by exp(-(rho / this)^2) (rho in lambda/D). The
-# spikes are not affected.
-PHYS_RING_FADE_LAMD = 9.0
-
-
-def _phys_ring_fade(rho):
-    return np.exp(-(np.asarray(rho, dtype=np.float64) / PHYS_RING_FADE_LAMD) ** 2)
-_phys_airy_luts = {}
-
-
-def _phys_airy_lut(eps, seeing=0.0):
-    """1-D table of the obstructed Airy intensity (0..60 lambda/D) times the
-    ring fade, smoothed by the seeing (Gaussian, FWHM `seeing` lambda/D), so the
-    per-pixel ring evaluation is one np.interp."""
-    key = (round(float(eps), 3), round(float(seeing), 2))
-    lut = _phys_airy_luts.get(key)
-    if lut is None:
-        step = 0.005
-        rho = np.arange(0.0, 60.0, step)
-        I = _airy_obstructed_intensity(rho, key[0]) * _phys_ring_fade(rho)
-        if seeing > 0.0:
-            sig = seeing / 2.355 / step
-            half = int(4 * sig) + 1
-            k = np.exp(-0.5 * (np.arange(-half, half + 1) / sig) ** 2)
-            k /= k.sum()
-            ext = np.concatenate([I[1:half + 1][::-1], I, I[-half - 1:-1][::-1]])
-            I = np.convolve(ext, k, mode="valid")
-        lut = (rho, I)
-        _phys_airy_luts[key] = lut
-    return lut
-
-
-def _phys_axes(x0, y0, x1, y1, lx, ly):
-    """Broadcast offsets from the star centre for the box [x0,x1) x [y0,y1):
-    dx has shape (1, w), dy shape (h, 1), both float32."""
-    dx = (np.arange(x0, x1, dtype=np.float32) - np.float32(lx))[None, :]
-    dy = (np.arange(y0, y1, dtype=np.float32) - np.float32(ly))[:, None]
-    return dx, dy
-
-
-def _phys_draw_analytic(cv, ox, oy, cx, cy, fwhm_px, u, p, lines, star_color, flux, blades=6, seeing=0.0):
-    """Closed-form rings + spikes of one star into canvas `cv` (pixel (i, j)
-    of cv is layer pixel (oy + i, ox + j)); see spec 4.3."""
-    if p["depth"] <= 0.0:
-        return
-    ch, cw = cv.shape[:2]
-    eps = min(0.95, max(0.0, p["obstruction"] / 100.0))
-    vane = max(p["vane"] / 100.0, 1e-4)
-    scales = _phys_channel_scales(p["dispersion"])
-    G = 10.0 ** (PHYS_DEPTH_DECADES * p["depth"] / 100.0)
-    norm = np.arcsinh(G)
-    mult = _phys_color_mult(p, star_color)
-    X = max(p["extent"] * fwhm_px, 1.0)
-    rings_gain, spikes_gain = p["rings"] / 100.0, p["spikes"] / 100.0
-    lx, ly = cx - ox, cy - oy
-
-    if rings_gain > 0.0:
-        R = min(X, PHYS_RING_MAX_LAMD * u * max(scales))
-        box = _phys_clip_box(lx - R, ly - R, lx + R, ly + R, cw, ch)
-        if box is not None:
-            x0, y0, x1, y1 = box
-            dx, dy = _phys_axes(x0, y0, x1, y1, lx, ly)
-            r = np.hypot(dx, dy)
-            mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.8 * R) / (0.2 * R)))
-            lut_rho, lut_I = _phys_airy_lut(eps, seeing)
-            for c in range(3):
-                sc = scales[c]
-                I = np.interp(r / np.float32(u * sc), lut_rho, lut_I).astype(np.float32)
-                I *= np.float32(flux / (sc * sc))
-                v = _phys_display(I, G, norm) * np.float32(rings_gain * mult[c]) * mask
-                sub = cv[y0:y1, x0:x1, c]
-                np.maximum(sub, v, out=sub)
-
-    if spikes_gain > 0.0:
-        a_max = X / (u * min(scales)) + 1.0
-        a_grid = np.linspace(0.0, a_max, int(a_max / 0.04) + 2)
-        for ln in lines:
-            sigq0 = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
-            sig_s = seeing / 2.355
-            sigq = float(np.sqrt(sigq0 * sigq0 + sig_s * sig_s))
-            amp_seeing = sigq0 / sigq          # the seeing widens the spike and lowers its peak
-            half_w = 4.5 * sigq * u * max(scales) + 1.0
-            box = _phys_strip_box(lx, ly, ln["angle"], X, half_w, cw, ch)
-            if box is None:
-                continue
-            x0, y0, x1, y1 = box
-            dx, dy = _phys_axes(x0, y0, x1, y1, lx, ly)
-            mask = _phys_mask(np.hypot(dx, dy), fwhm_px, X)
-            th = np.radians(ln["angle"])
-            ca, sa = np.float32(np.cos(th)), np.float32(np.sin(th))
-            prof = _phys_spike_along(a_grid, ln, eps, vane)
-            for c in range(3):
-                sc = scales[c]
-                inv_uc = np.float32(1.0 / (u * sc))
-                a = (dx * ca + dy * sa) * inv_uc
-                q = (dy * ca - dx * sa) * inv_uc
-                along = np.interp(a, a_grid, prof).astype(np.float32)
-                I = along * np.exp(q * q * np.float32(-0.5 / (sigq * sigq)))
-                I *= np.float32(flux * amp_seeing / (sc * sc))
-                v = _phys_display(I, G, norm) * np.float32(spikes_gain * mult[c]) * mask
-                sub = cv[y0:y1, x0:x1, c]
-                np.maximum(sub, v, out=sub)
-
-
-def _phys_hash01(x, y, i, salt):
-    a, b = _star_jitter_pair(x * (1.0 + 0.137 * salt) + 13.7 * i, y * (1.0 + 0.071 * salt) + 7.3 * i)
-    return 0.5 * (a + 1.0) if salt % 2 == 0 else 0.5 * (b + 1.0)
-
-
-def _phys_draw_streaks(cv, ox, oy, cx, cy, fwhm_px, u, p, star_color, flux, sx, sy):
-    """Thin dust/scratch streaks with deterministic random angle, length and
-    brightness (seeded by the star's own position). Display units, not
-    multiplied by depth."""
-    amount = p["streaks"] / 100.0
-    if amount <= 0.0:
-        return
-    ch, cw = cv.shape[:2]
-    lx, ly = cx - ox, cy - oy
-    mult = _phys_color_mult(p, star_color)
-    sigma = max(0.6, 0.15 * u)
-    n = int(round(amount * 14.0))
-    for i in range(n):
-        ang = 360.0 * _phys_hash01(sx, sy, i, 0)
-        length = (0.4 + 0.6 * _phys_hash01(sx, sy, i, 1)) * p["streak_len"] * fwhm_px
-        bright = 0.3 + 0.7 * _phys_hash01(sx, sy, i, 2)
-        peak = 0.5 * amount * flux * bright
-        box = _phys_strip_box(lx, ly, ang, length, 4.0 * sigma + 1.0, cw, ch)
-        if box is None:
-            continue
-        x0, y0, x1, y1 = box
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        dx, dy = xx - lx, yy - ly
-        th = np.radians(ang)
-        along = dx * np.cos(th) + dy * np.sin(th)
-        perp = -dx * np.sin(th) + dy * np.cos(th)
-        t = np.clip(along / max(length, 1e-6), 0.0, 1.0)
-        prof = np.exp(-(perp * perp) / (2.0 * sigma * sigma)) * (1.0 - t) ** 1.2 * (along > 0.0)
-        prof = prof * _smoothstep_arr((np.hypot(dx, dy) - 0.5 * fwhm_px) / (0.6 * fwhm_px))
-        for c in range(3):
-            sub = cv[y0:y1, x0:x1, c]
-            np.maximum(sub, (peak * prof * mult[c]).astype(np.float32), out=sub)
-
-
-_PHYS_TPL_N = 1024
-_PHYS_TPL_D = 64.0
-_PHYS_TPL_LAMD = _PHYS_TPL_N / _PHYS_TPL_D          # template px per lambda/D at 530 nm
-_PHYS_TPL_LAMBDAS = np.linspace(430.0, 670.0, 12)
-_PHYS_TPL_MAX = 4
-_PHYS_TPL_LEVELS = 4
-_PHYS_SENSOR = ((600.0, 40.0), (535.0, 40.0), (455.0, 30.0))   # (centre, sigma) of R, G, B
-_phys_tpl_cache = collections.OrderedDict()
-_phys_tpl_lock = threading.Lock()
-
-
-def _phys_pupil(N, D, eps, aperture, blades, rotation_deg, vane_frac, with_vanes=True):
-    """Soft-edged pupil transmission on an N x N grid (aperture diameter D px)."""
-    y, x = np.mgrid[:N, :N].astype(np.float32)
-    x -= N / 2.0
-    y -= N / 2.0
-    r = np.hypot(x, y)
-    soft = lambda d: np.clip(d + 0.5, 0.0, 1.0)
-    if aperture == "polygon":
-        n = int(blades)
-        apothem = D / 2.0 * np.cos(np.pi / n)
-        ins = np.full_like(r, 1e9)
-        for k in range(n):
-            phi = np.radians(rotation_deg + 90.0 + 360.0 * k / n)
-            ins = np.minimum(ins, apothem - (x * np.cos(phi) + y * np.sin(phi)))
-        pup = soft(ins)
-    else:
-        pup = soft(D / 2.0 - r)
-    if eps > 0.0:
-        pup = pup * soft(r - eps * D / 2.0)
-    if with_vanes and aperture != "polygon":
-        w = vane_frac * D
-        base = rotation_deg if aperture == "spider4" else rotation_deg + 90.0
-        step, count = (90.0, 4) if aperture == "spider4" else (120.0, 3)
-        for k in range(count):
-            t = np.radians(base + step * k)
-            along = x * np.cos(t) + y * np.sin(t)
-            perp = -x * np.sin(t) + y * np.cos(t)
-            cover = np.clip(np.minimum(perp + 0.5, w / 2.0) - np.maximum(perp - 0.5, -w / 2.0), 0.0, 1.0)
-            pup = pup * (1.0 - cover * (along > 0.0))
-    return pup.astype(np.float32)
-
-
-def _phys_mips(a):
-    out = [a]
-    for _ in range(_PHYS_TPL_LEVELS - 1):
-        b = out[-1]
-        out.append(0.25 * (b[0::2, 0::2] + b[1::2, 0::2] + b[0::2, 1::2] + b[1::2, 1::2]))
-    return out
-
-
-def _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion, seeing=0.0):
-    N, D = _PHYS_TPL_N, _PHYS_TPL_D
-    d = dispersion / 100.0
-    lams = _PHYS_TPL_LAMBDAS if d > 0.0 else np.array([PHYS_LAMBDA_REF])
-    wts = np.array([[np.exp(-0.5 * ((l - c) / s) ** 2) for l in lams] for c, s in _PHYS_SENSOR])
-    wts /= wts.sum(axis=1, keepdims=True)
-    yy, xx = np.mgrid[:N, :N].astype(np.float32)
-    r = np.hypot(xx - N / 2.0, yy - N / 2.0)
-    ref_peak = float(_phys_pupil(N, D, eps, aperture, blades, rotation_deg, vane_frac, False).sum())
-    full = np.zeros((N, N, 3), np.float32)
-    ring = np.zeros((N, N, 3), np.float32)
-    for i, lam in enumerate(lams):
-        lam_eff = PHYS_LAMBDA_REF + d * (lam - PHYS_LAMBDA_REF)
-        pup = _phys_pupil(N, D * PHYS_LAMBDA_REF / lam_eff, eps, aperture, blades, rotation_deg, vane_frac)
-        F = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(pup)))
-        I = ((F.real ** 2 + F.imag ** 2) / max(float(pup.sum()), 1e-9) / ref_peak).astype(np.float32)
-        rho = r / (_PHYS_TPL_LAMD * lam_eff / PHYS_LAMBDA_REF)
-        ir = (_airy_obstructed_intensity(rho, eps) * (PHYS_LAMBDA_REF / lam_eff) ** 2).astype(np.float32)
-        for c in range(3):
-            full[..., c] += wts[c, i] * I
-            ring[..., c] += wts[c, i] * ir
-    if seeing > 0.0:
-        # Gaussian seeing in lambda/D units (channel independent), applied in Fourier space
-        sig = seeing / 2.355 * _PHYS_TPL_LAMD
-        ky = np.fft.fftfreq(N)[:, None]
-        kx = np.fft.rfftfreq(N)[None, :]
-        H = np.exp(-2.0 * (np.pi * sig) ** 2 * (kx * kx + ky * ky))
-        for arr in (full, ring):
-            for c in range(3):
-                arr[..., c] = np.fft.irfft2(np.fft.rfft2(arr[..., c]) * H, s=(N, N)).astype(np.float32)
-    # `ring` is still the plain (unfaded) Airy here, so subtracting it leaves only the
-    # vane/edge part in `spk`; the fade is applied to the ring part afterwards.
-    spk = np.maximum(full - ring, 0.0)
-    rr = r / _PHYS_TPL_LAMD
-    # the Airy near field belongs to the rings: spikes switch on beyond ~2 lambda/D
-    spk *= _smoothstep_arr((rr - 2.0) / 4.0)[..., None].astype(np.float32)
-    # keep only a band (+-2 lateral sigma) around each spike axis: the secondary
-    # lobes between the spikes are washed out by the seeing (and absent from the
-    # analytic branch), while the colour fringes along the spikes survive
-    gx, gy = xx - N / 2.0, yy - N / 2.0
-    sig_s = seeing / 2.355
-    band = np.zeros((N, N), np.float32)
-    for ln in _phys_spike_lines(aperture, blades, rotation_deg):
-        sigq0 = ln["lat"] / (1.0 - eps) if ln["kind"] == "vane" else ln["lat"]
-        sigq = float(np.sqrt(sigq0 ** 2 + sig_s ** 2)) * max(_phys_channel_scales(dispersion))
-        th = np.radians(ln["angle"])
-        a_ax = (gx * np.cos(th) + gy * np.sin(th)) / _PHYS_TPL_LAMD
-        q_ax = (-gx * np.sin(th) + gy * np.cos(th)) / _PHYS_TPL_LAMD
-        lane = np.exp(-(q_ax * q_ax) / (2.0 * (2.0 * sigq) ** 2)) * (a_ax > 0.0)
-        band = np.maximum(band, lane.astype(np.float32))
-    spk *= band[..., None]
-    ring *= _phys_ring_fade(rr)[..., None].astype(np.float32)
-    return {"N": N, "ring": _phys_mips(ring), "spk": _phys_mips(spk)}
-
-
-def _phys_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion, seeing=0.0):
-    """Polychromatic PSF template (ring part + spike part) for one aperture
-    setup, cached (LRU, lock-protected). eps and vane_frac are fractions."""
-    key = (aperture, int(blades) if aperture == "polygon" else 0, round(float(rotation_deg), 2),
-           round(float(eps), 3), round(float(vane_frac), 5), round(float(dispersion), 1),
-           round(float(seeing), 2))
-    with _phys_tpl_lock:
-        tpl = _phys_tpl_cache.get(key)
-        if tpl is not None:
-            _phys_tpl_cache.move_to_end(key)
-            return tpl
-    tpl = _phys_build_template(aperture, blades, rotation_deg, eps, vane_frac, dispersion, seeing)
-    with _phys_tpl_lock:
-        _phys_tpl_cache[key] = tpl
-        while len(_phys_tpl_cache) > _PHYS_TPL_MAX:
-            _phys_tpl_cache.popitem(last=False)
-    return tpl
-
-
-def _phys_bilinear(arr, fx, fy):
-    h, w = arr.shape[:2]
-    x0 = np.floor(fx).astype(np.intp)
-    y0 = np.floor(fy).astype(np.intp)
-    tx = (fx - x0).astype(np.float32)[..., None]
-    ty = (fy - y0).astype(np.float32)[..., None]
-    x0c, x1c = np.clip(x0, 0, w - 1), np.clip(x0 + 1, 0, w - 1)
-    y0c, y1c = np.clip(y0, 0, h - 1), np.clip(y0 + 1, 0, h - 1)
-    return ((arr[y0c, x0c] * (1 - tx) + arr[y0c, x1c] * tx) * (1 - ty)
-            + (arr[y1c, x0c] * (1 - tx) + arr[y1c, x1c] * tx) * ty)
-
-
-def _phys_draw_fft(cv, ox, oy, cx, cy, fwhm_px, u, p, tpl, star_color, flux):
-    """Stamp one large star from the FFT template (see spec 4.4)."""
-    if p["depth"] <= 0.0:
-        return
-    ch, cw = cv.shape[:2]
-    Nt = tpl["N"]
-    ratio = u / _PHYS_TPL_LAMD                     # image px per template px
-    R_t = 0.49 * Nt * ratio
-    X = max(p["extent"] * fwhm_px, 1.0)
-    R = min(X, R_t)
-    lx, ly = cx - ox, cy - oy
-    box = _phys_clip_box(lx - R, ly - R, lx + R, ly + R, cw, ch)
-    if box is None:
-        return
-    x0, y0, x1, y1 = box
-    yy, xx = np.mgrid[y0:y1, x0:x1]
-    dx, dy = xx - lx, yy - ly
-    r = np.hypot(dx, dy)
-    level = int(np.clip(np.floor(np.log2(max(1.0 / ratio, 1.0))), 0, len(tpl["ring"]) - 1))
-    div = 2.0 ** level
-    fx = (dx / ratio + Nt / 2.0 + 0.5) / div - 0.5
-    fy = (dy / ratio + Nt / 2.0 + 0.5) / div - 0.5
-    ring = _phys_bilinear(tpl["ring"][level], fx, fy)
-    spk = _phys_bilinear(tpl["spk"][level], fx, fy)
-    rg, sg = p["rings"] / 100.0, p["spikes"] / 100.0
-    G = 10.0 ** (PHYS_DEPTH_DECADES * p["depth"] / 100.0)
-    norm = np.arcsinh(G)
-    mask = _phys_mask(r, fwhm_px, X) * (1.0 - _smoothstep_arr((r - 0.85 * R) / (0.15 * R)))
-    mult = _phys_color_mult(p, star_color)
-    for c in range(3):
-        v = np.maximum(rg * _phys_display(ring[..., c] * flux, G, norm),
-                       sg * _phys_display(spk[..., c] * flux, G, norm))
-        v = (v * mask * mult[c]).astype(np.float32)
-        sub = cv[y0:y1, x0:x1, c]
-        np.maximum(sub, v, out=sub)
-
-
-def render_physical_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
-    """Physical spike layer (rings, spikes, streaks) for a window of the
-    full-resolution image, scaled to out_shape=(out_h, out_w). Same star
-    tuples and the same size-class/cutoff logic as render_spike_layer; small
-    stars use the closed-form model, large ones the FFT template, with a
-    log-diameter cross-fade in between (see the design spec).
-
-    cfg: {"anchors": [dicts with "diam" + _PHYS_PARAM_KEYS], "aperture":
-    "spider4"|"spider3"|"polygon", "blades": int, "rotation": deg,
-    "fft_from": star diameter in px above which the FFT template is used
-    (>= 200 means never), "seeing": Gaussian softening FWHM in lambda/D (0 = off)}."""
-    out_h, out_w = out_shape
-    layer = np.zeros((out_h, out_w, 3), dtype=np.float32)
-    if not stars or view_w <= 0:
-        return layer
-    anchors_sorted = sorted(cfg["anchors"], key=lambda a: a["diam"])
-    min_diameter = anchors_sorted[0]["diam"]
-    scale = out_w / float(view_w)
-    max_amp = max((s[3] for s in stars), default=1.0) or 1.0
-    fft_from = float(cfg.get("fft_from", 15.0))
-    use_fft = fft_from < 200.0
-    lo_t = fft_from / 1.6
-    aperture, blades, rot = cfg["aperture"], int(cfg["blades"]), float(cfg["rotation"])
-    seeing = float(cfg.get("seeing", 0.0))
-    lines = _phys_spike_lines(aperture, blades, rot)
-
-    for (x, y, fwhm, amp, color, forced, override) in stars:
-        if override is not None:
-            p = override
-        elif fwhm < min_diameter and not forced:
-            continue
-        else:
-            p = _interp_anchor_params(anchors_sorted, max(fwhm, min_diameter), _PHYS_PARAM_KEYS)
-        if p["depth"] <= 0.0 and p["streaks"] <= 0.0:
-            continue
-        margin = fwhm * max(p["extent"], p["streak_len"], 6.0) + fwhm
-        if not (view_x0 - margin <= x <= view_x0 + view_w + margin and
-                view_y0 - margin <= y <= view_y0 + view_h + margin):
-            continue
-        cx, cy = (x - view_x0) * scale, (y - view_y0) * scale
-        fwhm_px = fwhm * scale
-        u = fwhm_px / PHYS_FWHM_PER_LAMD
-        flux = sflux = min(1.0, max(0.03, amp / max_amp))
-        color = tuple(color)
-
-        if p["depth"] > 0.0:
-            if use_fft and fwhm >= lo_t:
-                w_fft = 1.0 if fwhm >= fft_from else float(_smoothstep_arr(
-                    (np.log(fwhm) - np.log(lo_t)) / (np.log(fft_from) - np.log(lo_t))))
-            else:
-                w_fft = 0.0
-            if w_fft <= 0.0:
-                _phys_draw_analytic(layer, 0, 0, cx, cy, fwhm_px, u, p, lines, color, flux, blades, seeing)
-            else:
-                tpl = _phys_template(aperture, blades, rot, p["obstruction"] / 100.0,
-                                     p["vane"] / 100.0, p["dispersion"], seeing)
-                if w_fft >= 1.0:
-                    _phys_draw_fft(layer, 0, 0, cx, cy, fwhm_px, u, p, tpl, color, flux)
-                else:
-                    R = max(p["extent"] * fwhm_px, 1.0) + 2.0
-                    box = _phys_clip_box(cx - R, cy - R, cx + R, cy + R, out_w, out_h)
-                    if box is not None:
-                        bx0, by0, bx1, by1 = box
-                        ca = np.zeros((by1 - by0, bx1 - bx0, 3), np.float32)
-                        cf = np.zeros_like(ca)
-                        _phys_draw_analytic(ca, bx0, by0, cx, cy, fwhm_px, u, p, lines, color, flux, blades, seeing)
-                        _phys_draw_fft(cf, bx0, by0, cx, cy, fwhm_px, u, p, tpl, color, flux)
-                        sub = layer[by0:by1, bx0:bx1]
-                        np.maximum(sub, w_fft * cf + (1.0 - w_fft) * ca, out=sub)
-
-        if p["streaks"] > 0.0:
-            _phys_draw_streaks(layer, 0, 0, cx, cy, fwhm_px, u, p, color, sflux, x, y)
-
-    return np.clip(layer, 0.0, 1.0)
-
-
 class SirilWorker:
     """Holds the connection to Siril and serializes all calls on a single thread."""
 
@@ -2091,34 +1503,7 @@ class App:
             self.spike_star[key] = tk.DoubleVar(value=val)
             self.spike_star[key + "_label"] = tk.StringVar(value=fmt.format(val))
         self.spike_star_info = tk.StringVar(value="")
-
-        # ---- Physical spikes (second layer) ----
-        pd = PHYS_DEFAULTS
-        self.phys_enabled = tk.BooleanVar(value=pd["enabled"])
-        self.phys_aperture = tk.StringVar(value=pd["aperture"])
-        self.phys_blades = tk.DoubleVar(value=float(pd["blades"]))
-        self.phys_rotation = tk.DoubleVar(value=pd["rotation"])
-        self.phys_fft_from = tk.DoubleVar(value=pd["fft_from"])
-        self.phys_seeing = tk.DoubleVar(value=pd["seeing"])
-        self.phys_seeing_label = tk.StringVar(value=f"{pd['seeing']:.1f}")
-        self.phys_blades_label = tk.StringVar(value=f"{pd['blades']:.0f}")
-        self.phys_rotation_label = tk.StringVar(value=f"{pd['rotation']:.0f}")
-        self.phys_fft_from_label = tk.StringVar(value=f"{pd['fft_from']:.0f}")
-
-        def _phys_vars(values):
-            out = {}
-            for key, _label, _lo, _hi, _step, fmt in PHYS_PARAM_DEFS:
-                out[key] = tk.DoubleVar(value=values[key])
-                out[key + "_label"] = tk.StringVar(value=fmt.format(values[key]))
-            return out
-
-        self.phys_anchors = [_phys_vars(a) for a in pd["anchors"]]
-        self.phys_uniform = _phys_vars(PHYS_UNIFORM_DEFAULTS)
-        self.phys_star = _phys_vars(PHYS_UNIFORM_DEFAULTS)
-        self._phys_star_overrides = {}     # same keys as _spike_star_overrides, independent values
-        self._phys_layer_preview = None
-        self._spike_layer_key = None       # cache keys: skip re-rendering a layer whose inputs did not change
-        self._phys_layer_key = None
+        self._spike_layer_key = None  # cache key: skip re-rendering the spike layer when its inputs didn't change
 
         self._pristine_full = None  # (H,W,3) float [0,1], fetched once from Siril
         self._src_preview_rgb = None  # raw (H,W,3) preview, before adjustments
@@ -2137,10 +1522,10 @@ class App:
         self.zoom_pct = 1.0
         self._display_zoom_pct = 1.0  # zoom_pct is relative to the fit preview raster; this is relative to the real image, for the label
         self.zoom_label = tk.StringVar(value="100%")
-        # Preview-only display mode: shows just the additive spike/physical
-        # layer(s) on black instead of blended onto the real photo, so their
-        # own shape/colour/rings can be judged without the image underneath.
-        # Never touches Process/import in Siril - see _on_hide_background_toggle.
+        # Preview-only display mode: shows just the additive spike layer on
+        # black instead of blended onto the real photo, so its own shape/
+        # colour/rings can be judged without the image underneath. Never
+        # touches Process/import in Siril - see _on_hide_background_toggle.
         self.hide_background = tk.BooleanVar(value=False)
 
         self.full_shape = None  # (h, w) of the original image
@@ -2501,75 +1886,6 @@ class App:
                    command=self._deselect_star).grid(
             row=r + 1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
 
-        # ---- Physical spikes: a second, physics-based layer combined (screen)
-        # with the classic spikes above. Follows the same Simple / Per size
-        # selector and the same Shift+Click star selection. ----
-        frm_phys = ttk.LabelFrame(frm_spikes, text="Physical spikes (beta)")
-        frm_phys.grid(row=13, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
-        frm_phys.grid_columnconfigure(0, minsize=210)
-        ttk.Checkbutton(frm_phys, text="Enable physical spikes", variable=self.phys_enabled,
-                         command=self._on_spike_slider).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
-        ttk.Label(frm_phys, text="Aperture", style="Card.TLabel").grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 0))
-        ap_box = ttk.Frame(frm_phys, style="Card.TFrame")
-        ap_box.grid(row=2, column=0, columnspan=3, sticky="w", padx=10)
-        for text, val in (("Spider, 4 vanes (4 spikes)", "spider4"),
-                          ("Spider, 3 vanes (6 spikes)", "spider3"),
-                          ("Diaphragm blades (polygon)", "polygon")):
-            ttk.Radiobutton(ap_box, text=text, value=val, variable=self.phys_aperture,
-                             command=self._on_spike_slider).pack(anchor="w")
-        self._add_slider(frm_phys, 3, "Blades (polygon only; odd = twice as many spikes)",
-                          self.phys_blades, self.phys_blades_label, 5, 9, step=1,
-                          on_change=self._on_spike_slider)
-        self._add_slider(frm_phys, 5, "Rotation angle (0-90 deg)",
-                          self.phys_rotation, self.phys_rotation_label, 0, 90, step=1,
-                          on_change=self._on_spike_slider)
-        self._add_slider(frm_phys, 7, "Use FFT model from star diameter (px, 200 = never)",
-                          self.phys_fft_from, self.phys_fft_from_label, 3, 200, step=1,
-                          on_change=self._on_spike_slider)
-
-        self._add_slider(frm_phys, 9, "Seeing softening (FWHM in lambda/D; 0 = razor sharp)",
-                          self.phys_seeing, self.phys_seeing_label, 0, 4, step=0.1,
-                          on_change=self._on_spike_slider)
-
-        self._phys_notebook = ttk.Notebook(frm_phys)
-        self._phys_notebook.grid(row=11, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
-        for tab_label, av in zip(PHYS_TAB_LABELS, self.phys_anchors):
-            tab = ttk.Frame(self._phys_notebook, style="Card.TFrame")
-            tab.grid_columnconfigure(0, minsize=200)
-            self._phys_notebook.add(tab, text=tab_label)
-            r = 0
-            for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
-                self._add_slider(tab, r, label, av[key], av[key + "_label"], lo, hi, step=step,
-                                  on_change=self._on_spike_slider)
-                r += 2
-
-        self._phys_uniform_frame = ttk.Frame(frm_phys, style="Card.TFrame")
-        self._phys_uniform_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
-        self._phys_uniform_frame.grid_columnconfigure(0, minsize=200)
-        r = 0
-        for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
-            self._add_slider(self._phys_uniform_frame, r, label, self.phys_uniform[key],
-                              self.phys_uniform[key + "_label"], lo, hi, step=step,
-                              on_change=self._on_spike_slider)
-            r += 2
-
-        self._phys_star_frame = ttk.Frame(frm_phys, style="Card.TFrame")
-        self._phys_star_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4))
-        self._phys_star_frame.grid_columnconfigure(0, minsize=200)
-        ttk.Label(self._phys_star_frame, text="Physical look of the selected star",
-                  style="Card.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 2))
-        r = 2
-        for key, label, lo, hi, step, _fmt in PHYS_PARAM_DEFS:
-            self._add_slider(self._phys_star_frame, r, label, self.phys_star[key],
-                              self.phys_star[key + "_label"], lo, hi, step=step,
-                              on_change=self._on_phys_star_slider_change)
-            r += 2
-        ttk.Button(self._phys_star_frame, text="Reset this star's physical look",
-                   style="Warn.TButton", command=self._reset_selected_phys_override).grid(
-            row=r, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 4))
-
         self._spike_help_per_size = ("Each star's own diameter blends smoothly between the\n"
                        "Small/Medium/Large tabs above - stars below the Small\n"
                        "tab's diameter get no spike at all. Ctrl+Click a star in\n"
@@ -2590,13 +1906,13 @@ class App:
                        "or empty space / Deselect to stop editing a single star.")
         self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
         self._spike_help_label.grid(
-            row=14, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+            row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
         ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
                    command=self._reset_spike_edits).grid(
-            row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+            row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
         ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
                    command=self._reset_spike_defaults).grid(
-            row=16, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+            row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
         self._update_spike_mode_ui()
 
         # ---- Status bar ----
@@ -2831,15 +2147,6 @@ class App:
             if key != "diam":
                 self.spike_uniform[key + "_label"].set(fmt.format(self.spike_uniform[key].get()))
                 self.spike_star[key + "_label"].set(fmt.format(self.spike_star[key].get()))
-        self.phys_blades_label.set(f"{self.phys_blades.get():.0f}")
-        self.phys_rotation_label.set(f"{self.phys_rotation.get():.0f}")
-        self.phys_fft_from_label.set(f"{self.phys_fft_from.get():.0f}")
-        self.phys_seeing_label.set(f"{self.phys_seeing.get():.1f}")
-        for key, _label, _lo, _hi, _step, fmt in PHYS_PARAM_DEFS:
-            for av in self.phys_anchors:
-                av[key + "_label"].set(fmt.format(av[key].get()))
-            self.phys_uniform[key + "_label"].set(fmt.format(self.phys_uniform[key].get()))
-            self.phys_star[key + "_label"].set(fmt.format(self.phys_star[key].get()))
 
     def _on_tone_slider(self):
         """Light & Tones / Color & Hue sliders: cheap, so recompute and
@@ -2925,84 +2232,6 @@ class App:
             {"diam": min_d * SPIKE_UNIFORM_REF_MULT, **full},
         ]
 
-    def _phys_uniform_anchors(self):
-        """Simple mode for the physical set: depth and streaks scale from 0 at
-        the shared cutoff to their slider value at 4x the cutoff; everything
-        else is constant (see spec 4.2)."""
-        min_d = self.spike_uniform_min_diam.get()
-        full = {k: self.phys_uniform[k].get() for k in _PHYS_PARAM_KEYS}
-        zero = dict(full, **{k: 0.0 for k in PHYS_FADE_KEYS})
-        return [{"diam": min_d, **zero}, {"diam": min_d * SPIKE_UNIFORM_REF_MULT, **full}]
-
-    def _phys_config(self):
-        """The config object render_physical_layer takes."""
-        if self.spike_mode.get() == "uniform":
-            anchors = self._phys_uniform_anchors()
-        else:
-            anchors = [dict({k: av[k].get() for k in _PHYS_PARAM_KEYS}, diam=cav["diam"].get())
-                       for av, cav in zip(self.phys_anchors, self.spike_anchors)]
-        return {
-            "anchors": anchors,
-            "aperture": self.phys_aperture.get(),
-            "blades": int(round(self.phys_blades.get())),
-            "rotation": self.phys_rotation.get(),
-            "fft_from": self.phys_fft_from.get(),
-            "seeing": self.phys_seeing.get(),
-        }
-
-    def _effective_phys_stars(self):
-        """Same star selection as _effective_stars() (shared disable/force/
-        manual edits), with the physical set's own per-star overrides."""
-        out = []
-        for i, (x, y, fwhm, amp, color) in enumerate(self._stars):
-            if i in self._spike_disabled:
-                continue
-            out.append((x, y, fwhm, amp, color, i in self._spike_forced,
-                        self._phys_star_overrides.get(("auto", i))))
-        for (mid, x, y, fwhm, amp, color) in self._spike_manual:
-            out.append((x, y, fwhm, amp, color, True, self._phys_star_overrides.get(("manual", mid))))
-        return out
-
-    def _current_phys_look_for_fwhm(self, fwhm):
-        anchors = sorted(self._phys_config()["anchors"], key=lambda a: a["diam"])
-        return _interp_anchor_params(anchors, max(fwhm, anchors[0]["diam"]), _PHYS_PARAM_KEYS)
-
-    def _on_phys_star_slider_change(self):
-        """A physical star-panel slider moved: snapshot all physical values as
-        that star's physical override (independent from the classic one)."""
-        self._update_all_labels()
-        if self._selected_star_key is None:
-            return
-        self._phys_star_overrides[self._selected_star_key] = {
-            k: self.phys_star[k].get() for k in _PHYS_PARAM_KEYS}
-        if not self.loaded:
-            return
-        self._schedule_spike_preview()
-        if self.zoom_mode == "manual":
-            self._schedule_hires_fetch()
-
-    def _reset_selected_phys_override(self):
-        if self._selected_star_key is None:
-            return
-        had = self._phys_star_overrides.pop(self._selected_star_key, None) is not None
-        self._select_star(self._selected_star_key)
-        if had:
-            self._schedule_spike_preview()
-
-    def _reset_phys_defaults(self):
-        pd = PHYS_DEFAULTS
-        self.phys_enabled.set(pd["enabled"])
-        self.phys_aperture.set(pd["aperture"])
-        self.phys_blades.set(float(pd["blades"]))
-        self.phys_rotation.set(pd["rotation"])
-        self.phys_fft_from.set(pd["fft_from"])
-        self.phys_seeing.set(pd["seeing"])
-        for av, defaults in zip(self.phys_anchors, pd["anchors"]):
-            for k in _PHYS_PARAM_KEYS:
-                av[k].set(defaults[k])
-        for k in _PHYS_PARAM_KEYS:
-            self.phys_uniform[k].set(PHYS_UNIFORM_DEFAULTS[k])
-
     def _spike_min_diameter(self):
         """The current mode's cutoff diameter - below it a star gets no
         spike at all (see render_spike_layer)."""
@@ -3037,7 +2266,6 @@ class App:
         self._spike_forced.clear()
         self._spike_manual.clear()
         self._spike_star_overrides.clear()
-        self._phys_star_overrides.clear()
         self._deselect_star()
         if self.loaded:
             self._schedule_spike_preview()
@@ -3060,7 +2288,6 @@ class App:
         self.spike_uniform_min_diam.set(ud["min_diam"])
         for key in _ANCHOR_PARAM_KEYS:
             self.spike_uniform[key].set(ud[key])
-        self._reset_phys_defaults()
         self._on_spike_slider()
 
     def _on_spike_mode_change(self):
@@ -3137,35 +2364,25 @@ class App:
 
     def _update_spike_mode_ui(self):
         """Shows whichever of the notebook (per-size tabs) / flat uniform
-        panel / single-star panel applies right now, for BOTH the classic set
-        and the physical set, and swaps the matching help text - only one of
-        the three control sets is ever visible at once. A star selection
-        (Shift+Click) always wins over the Simple/Per-size mode choice, which
-        stays remembered underneath and reappears as soon as the star is
-        deselected."""
+        panel / single-star panel applies right now, and swaps the matching
+        help text - only one of the three control sets is ever visible at
+        once. A star selection (Shift+Click) always wins over the Simple/
+        Per-size mode choice, which stays remembered underneath and
+        reappears as soon as the star is deselected."""
         if self._selected_star_key is not None:
             self._spike_notebook.grid_remove()
             self._spike_uniform_frame.grid_remove()
             self._spike_star_frame.grid()
-            self._phys_notebook.grid_remove()
-            self._phys_uniform_frame.grid_remove()
-            self._phys_star_frame.grid()
             self._spike_help_label.config(text=self._spike_help_star)
         elif self.spike_mode.get() == "uniform":
             self._spike_notebook.grid_remove()
             self._spike_star_frame.grid_remove()
             self._spike_uniform_frame.grid()
-            self._phys_notebook.grid_remove()
-            self._phys_star_frame.grid_remove()
-            self._phys_uniform_frame.grid()
             self._spike_help_label.config(text=self._spike_help_uniform)
         else:
             self._spike_uniform_frame.grid_remove()
             self._spike_star_frame.grid_remove()
             self._spike_notebook.grid()
-            self._phys_uniform_frame.grid_remove()
-            self._phys_star_frame.grid_remove()
-            self._phys_notebook.grid()
             self._spike_help_label.config(text=self._spike_help_per_size)
 
     def _current_look_for_fwhm(self, fwhm):
@@ -3208,10 +2425,6 @@ class App:
         values = override if override is not None else self._current_look_for_fwhm(fwhm)
         for k in _ANCHOR_PARAM_KEYS:
             self.spike_star[k].set(values[k])
-        pov = self._phys_star_overrides.get(key)
-        pvals = pov if pov is not None else self._current_phys_look_for_fwhm(fwhm)
-        for k in _PHYS_PARAM_KEYS:
-            self.phys_star[k].set(pvals[k])
         state = "custom look" if override is not None else "size-based look"
         self.spike_star_info.set(f"Editing star (fwhm ≈ {fwhm:.1f}px) - showing its {state}")
         self._update_all_labels()
@@ -3288,8 +2501,6 @@ class App:
         rgb = np.zeros_like(self._base_preview_rgb) if self.hide_background.get() else self._base_preview_rgb
         if self.spike_enabled.get() and self._spike_layer_preview is not None:
             rgb = apply_spikes(rgb, self._spike_layer_preview)
-        if self.phys_enabled.get() and self._phys_layer_preview is not None:
-            rgb = apply_spikes(rgb, self._phys_layer_preview)
         self._preview_rgb = rgb
 
     def _schedule_spike_preview(self):
@@ -3319,70 +2530,55 @@ class App:
             return
         self._spike_preview_gen += 1
         gen = self._spike_preview_gen
-        ph, pw = self._base_preview_rgb.shape[:2]
-        fh, fw = self.full_shape
 
-        stars = self._effective_stars() if self.spike_enabled.get() else []
-        want_c = bool(stars)
-        if not want_c:
+        if not self.spike_enabled.get():
             self._spike_layer_preview = None
             self._spike_layer_key = None
-        pstars = self._effective_phys_stars() if self.phys_enabled.get() else []
-        want_p = bool(pstars)
-        if not want_p:
-            self._phys_layer_preview = None
-            self._phys_layer_key = None
+            self._compose_preview()
+            self._redraw_canvas()
+            return
 
-        params = self._spike_config() if want_c else None
-        ss = self._spike_supersample(ph, pw) if want_c else 1
-        pparams = self._phys_config() if want_p else None
-        # Each layer is re-rendered only when its own inputs changed.
-        ckey = repr((stars, params, ss, ph, pw)) if want_c else None
-        pkey = repr((pstars, pparams, ph, pw)) if want_p else None
-        need_c = want_c and ckey != self._spike_layer_key
-        need_p = want_p and pkey != self._phys_layer_key
-        if not (need_c or need_p):
+        stars = self._effective_stars()
+        if not stars:
+            self._spike_layer_preview = None
+            self._spike_layer_key = None
+            self._compose_preview()
+            self._redraw_canvas()
+            return
+
+        ph, pw = self._base_preview_rgb.shape[:2]
+        fh, fw = self.full_shape
+        params = self._spike_config()
+        ss = self._spike_supersample(ph, pw)
+        key = repr((stars, params, ss, ph, pw))
+        if key == self._spike_layer_key:
             self._compose_preview()
             self._redraw_canvas()
             return
         self._spike_preview_inflight = True
         self._busy_begin()
-        t = threading.Thread(
-            target=self._spike_preview_thread,
-            args=(gen, ph, pw, fh, fw, stars, params, ss, pstars, pparams, need_c, need_p, ckey, pkey),
-            daemon=True)
+        t = threading.Thread(target=self._spike_preview_thread,
+                              args=(gen, ph, pw, fh, fw, stars, params, ss, key), daemon=True)
         t.start()
 
-    def _spike_preview_thread(self, gen, ph, pw, fh, fw, stars, params, ss,
-                              pstars, pparams, need_c, need_p, ckey, pkey):
+    def _spike_preview_thread(self, gen, ph, pw, fh, fw, stars, params, ss, key):
         # Always post something, success or failure - _poll_queue's
         # "spike_preview" handler pairs every message here with the
         # _busy_begin() this thread's launch made, so the busy spinner
         # would otherwise spin forever after a failed render.
-        layer = player = None
+        layer = None
         try:
-            if need_c:
-                if ss > 1:
-                    layer = render_spike_layer((ph * ss, pw * ss), 0, 0, fw, fh, stars, params)
-                    layer = resize_layer(layer, pw, ph)
-                else:
-                    layer = render_spike_layer((ph, pw), 0, 0, fw, fh, stars, params)
+            if ss > 1:
+                layer = render_spike_layer((ph * ss, pw * ss), 0, 0, fw, fh, stars, params)
+                layer = resize_layer(layer, pw, ph)
+            else:
+                layer = render_spike_layer((ph, pw), 0, 0, fw, fh, stars, params)
         except Exception as e:
             try:
                 self.worker.log(f"frankSpikes: spike preview render failed: {e}")
             except Exception:
                 pass
-        try:
-            if need_p:
-                player = render_physical_layer((ph, pw), 0, 0, fw, fh, pstars, pparams)
-        except Exception as e:
-            try:
-                self.worker.log(f"frankSpikes: physical spike preview render failed: {e}")
-            except Exception:
-                pass
-        self.queue.put(("spike_preview", (gen, layer, player,
-                                          ckey if layer is not None else None,
-                                          pkey if player is not None else None)))
+        self.queue.put(("spike_preview", (gen, layer, key)))
 
     # ---------- Zoom / pan / canvas ----------
     # In "fit" mode the low-resolution raster is always shown (that's fine:
@@ -3733,8 +2929,7 @@ class App:
         self._hires_gen += 1
         gen = self._hires_gen
         vals = self._slider_values()
-        spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_config(),
-                       self.phys_enabled.get(), self._effective_phys_stars(), self._phys_config())
+        spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_config())
         full = self._pristine_full
         hide_bg = self.hide_background.get()
         self._hires_inflight = True
@@ -3758,15 +2953,11 @@ class App:
             rgb = apply_cosmetics(rgb, *vals)
             if hide_bg:
                 rgb = np.zeros_like(rgb)
-            spike_enabled, stars, sparams, phys_enabled, pstars, pparams = spike_state
+            spike_enabled, stars, sparams = spike_state
             if spike_enabled and stars:
                 layer = render_spike_layer((got_h, got_w), req_x, req_y, req_w, req_h,
                                             stars, sparams)
                 rgb = apply_spikes(rgb, layer)
-            if phys_enabled and pstars:
-                player = render_physical_layer((got_h, got_w), req_x, req_y, req_w, req_h,
-                                               pstars, pparams)
-                rgb = apply_spikes(rgb, player)
             actual_wh = (got_w, got_h)
         except Exception as e:
             # This is only a high-res preview: on failure we just stay on the
@@ -3941,9 +3132,6 @@ class App:
             spike_enabled = self.spike_enabled.get()
             stars = self._effective_stars()
             sparams = self._spike_config()
-            phys_enabled = self.phys_enabled.get()
-            pstars = self._effective_phys_stars()
-            pparams = self._phys_config()
 
             if self._pristine_full is None:
                 raise RuntimeError("No image loaded from Siril yet.")
@@ -3963,12 +3151,6 @@ class App:
                 fh, fw = self.full_shape
                 layer = render_spike_layer((fh, fw), 0, 0, fw, fh, stars, sparams)
                 rgb_final = apply_spikes(rgb_final, layer)
-
-            if phys_enabled and pstars:
-                self.queue.put(("status", "Process: rendering physical spikes..."))
-                fh, fw = self.full_shape
-                player = render_physical_layer((fh, fw), 0, 0, fw, fh, pstars, pparams)
-                rgb_final = apply_spikes(rgb_final, player)
 
             self.queue.put(("status", "Process: applying to the active image in Siril..."))
             self.worker.push_rgb(rgb_final)
@@ -3995,7 +3177,6 @@ class App:
                     self._spike_manual = []
                     self._manual_id_counter = 0
                     self._spike_star_overrides = {}
-                    self._phys_star_overrides = {}
                     self._selected_star_key = None
                     self.loaded = True
                     self._siril_busy = False
@@ -4019,19 +3200,14 @@ class App:
                         self._hires_wh = actual_wh
                         self._redraw_canvas()
                 elif kind == "spike_preview":
-                    gen, layer, player, ckey, pkey = payload
+                    gen, layer, key = payload
                     self._spike_preview_inflight = False
                     self._busy_end()
-                    if gen == self._spike_preview_gen:
-                        if layer is not None:
-                            self._spike_layer_preview = layer
-                            self._spike_layer_key = ckey
-                        if player is not None:
-                            self._phys_layer_preview = player
-                            self._phys_layer_key = pkey
-                        if layer is not None or player is not None:
-                            self._compose_preview()
-                            self._redraw_canvas()
+                    if layer is not None and gen == self._spike_preview_gen:
+                        self._spike_layer_preview = layer
+                        self._spike_layer_key = key
+                        self._compose_preview()
+                        self._redraw_canvas()
                 elif kind == "done":
                     self._busy_end()
                     self._siril_busy = False

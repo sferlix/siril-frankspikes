@@ -31,7 +31,7 @@ def shot(name):
 
 
 shot("ui_simple.png")
-# scroll the spikes panel down to the physical frame
+# scroll the spikes panel down to see the rest of the controls
 app._spikes_canvas.yview_moveto(0.55)
 shot("ui_simple_scrolled.png")
 root.destroy()

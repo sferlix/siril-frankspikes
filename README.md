@@ -31,14 +31,6 @@ Realistic star spikes as produced by a reflector's secondary-mirror spider:
 - **Natural variation** — a small, deterministic per-star jitter on each spike's length and rotation (seeded by the star's own position) that breaks up the "stamped" look of many similar-size stars all rendering an identical spike
 - Brightness also follows the star's own amplitude on top of its size, with each spike taking on **its own star's real color** (sampled from the star's own core pixels) rather than a flat white glow
 - **Soft flare tail** — a per-size/per-star slider that adds a long power-law tail to the Soft flare glow (0 = the original gaussian-only glow, unchanged)
-- **Physical spikes (beta)** — a second, physics-based layer that is *added on top of* the classic spikes (screen blend), so you can mix both or compare them on the same photo. It is off by default; with it off and the tail at 0 the result is identical to 2.0. It models the aperture instead of drawing an artistic ray:
-  - **Aperture** — 4-vane or 3-vane spider, or a diaphragm with 5-9 blades (an odd number of blades gives twice as many spikes)
-  - **Vane thickness** — thinner vanes give dimmer but longer spikes (the spike level scales with the square of the thickness)
-  - **Rings & central obstruction** — Airy rings whose strength depends on the secondary-mirror obstruction
-  - **Chromatic dispersion** — colour comes from wavelength (rings and spike fringes scale with λ), not from a gradient along the ray
-  - **Dust/scratch streaks** — thin random streaks with a per-star deterministic angle
-  - **Seeing softening** — washes out the fine ring/lobe structure like real seeing
-  - Depth, extent, strengths, obstruction, dispersion and streaks work globally (Simple), per size class (Small/Medium/Large tabs) and per single star (Shift+Click), independently of the classic controls. Small stars use a fast closed-form model; stars above a diameter you choose use a Fourier-optics PSF computed once and stamped
 - **Realistic ring & soft flare** — sized off real diffraction physics: the ring stays close to the star (like a real telescope's Airy diffraction ring) rather than floating past a short spike, and a second, fainter ring is added alongside it — a real Airy pattern is a series of rings, not one clean circle
 - **Sharpness** — softens the whole effect for long focal lengths, where seeing/optics blur real diffraction spikes well beyond a pixel-crisp render
 - **Color hue** — a global rotation of every spike's own star color
@@ -48,7 +40,7 @@ Realistic star spikes as produced by a reflector's secondary-mirror spider:
 
 ### Preview & workflow
 - Real full-resolution pan/zoom preview (Fit / 100% / +/-), with a **Navigator** thumbnail showing the current viewport
-- **Hide background (spikes only)** — a toolbar checkbox that shows just the additive spike/physical layer(s) on black, so their own shape and colour can be judged without the photo underneath. Preview-only: never affects Process/import in Siril
+- **Hide background (spikes only)** — a toolbar checkbox that shows just the additive spike layer on black, so its own shape and colour can be judged without the photo underneath. Preview-only: never affects Process/import in Siril
 - Hold **Space** over the preview to flash back to the original, untouched image at the same pan/zoom position
 - The mouse pointer switches to a busy cursor whenever a render is in progress, so it's always clear when it's safe to keep adjusting
 - **Process and import in Siril** applies the result directly to the active image and pushes its own undo checkpoint in Siril — the script window stays open, so you can keep adjusting and reprocessing as many times as you like before saving
