@@ -48,6 +48,7 @@ Realistic star spikes as produced by a reflector's secondary-mirror spider:
 
 ### Preview & workflow
 - Real full-resolution pan/zoom preview (Fit / 100% / +/-), with a **Navigator** thumbnail showing the current viewport
+- **Hide background (spikes only)** — a toolbar checkbox that shows just the additive spike/physical layer(s) on black, so their own shape and colour can be judged without the photo underneath. Preview-only: never affects Process/import in Siril
 - Hold **Space** over the preview to flash back to the original, untouched image at the same pan/zoom position
 - The mouse pointer switches to a busy cursor whenever a render is in progress, so it's always clear when it's safe to keep adjusting
 - **Process and import in Siril** applies the result directly to the active image and pushes its own undo checkpoint in Siril — the script window stays open, so you can keep adjusting and reprocessing as many times as you like before saving

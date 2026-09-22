@@ -2137,6 +2137,11 @@ class App:
         self.zoom_pct = 1.0
         self._display_zoom_pct = 1.0  # zoom_pct is relative to the fit preview raster; this is relative to the real image, for the label
         self.zoom_label = tk.StringVar(value="100%")
+        # Preview-only display mode: shows just the additive spike/physical
+        # layer(s) on black instead of blended onto the real photo, so their
+        # own shape/colour/rings can be judged without the image underneath.
+        # Never touches Process/import in Siril - see _on_hide_background_toggle.
+        self.hide_background = tk.BooleanVar(value=False)
 
         self.full_shape = None  # (h, w) of the original image
         self.view_cx = 0.5
@@ -2352,6 +2357,9 @@ class App:
                        command=cmd).pack(side="left", padx=(0, 1), pady=6)
         ttk.Label(frm_toolbar, textvariable=self.zoom_label, style="ZoomPct.TLabel",
                   width=6, anchor="center").pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(frm_toolbar, text="Hide background (spikes only)",
+                         variable=self.hide_background,
+                         command=self._on_hide_background_toggle).pack(side="left", padx=(16, 0))
         ttk.Label(frm_toolbar, text="Fit: fast low-res preview — 100%/+/-: real full-resolution"
                                      " crop (drag, scroll wheel, or the scrollbars to pan)",
                   style="CardMuted.TLabel").pack(side="left", padx=(16, 0))
@@ -2859,6 +2867,21 @@ class App:
         if self.zoom_mode == "manual":
             self._schedule_hires_fetch()
 
+    def _on_hide_background_toggle(self):
+        """'Hide background' - a preview-only display mode, not a render
+        parameter: the cached layers don't change, only how they're
+        composited, so this just recomposes/redraws (Fit) and re-fetches
+        the hi-res crop (100%/+/-) instead of the full debounced re-render
+        _on_spike_slider uses. Never affects Process/import in Siril -
+        _process_thread always composites onto the real image regardless
+        of this flag."""
+        if not self.loaded:
+            return
+        self._compose_preview()
+        self._redraw_canvas()
+        if self.zoom_mode == "manual":
+            self._schedule_hires_fetch()
+
     def _slider_values(self):
         return (self.exposure.get(), self.temperature.get(), self.tint.get(),
                 self.contrast.get(), self.blacks.get(), self.highlights.get(),
@@ -3262,7 +3285,7 @@ class App:
         self._redraw_canvas()
 
     def _compose_preview(self):
-        rgb = self._base_preview_rgb
+        rgb = np.zeros_like(self._base_preview_rgb) if self.hide_background.get() else self._base_preview_rgb
         if self.spike_enabled.get() and self._spike_layer_preview is not None:
             rgb = apply_spikes(rgb, self._spike_layer_preview)
         if self.phys_enabled.get() and self._phys_layer_preview is not None:
@@ -3713,13 +3736,14 @@ class App:
         spike_state = (self.spike_enabled.get(), self._effective_stars(), self._spike_config(),
                        self.phys_enabled.get(), self._effective_phys_stars(), self._phys_config())
         full = self._pristine_full
+        hide_bg = self.hide_background.get()
         self._hires_inflight = True
         self._busy_begin()
         t = threading.Thread(target=self._hires_fetch_thread,
-                              args=(gen, crop, vals, spike_state, full), daemon=True)
+                              args=(gen, crop, vals, spike_state, full, hide_bg), daemon=True)
         t.start()
 
-    def _hires_fetch_thread(self, gen, crop, vals, spike_state, full):
+    def _hires_fetch_thread(self, gen, crop, vals, spike_state, full, hide_bg):
         # Always post something, success or failure - see the matching note
         # in _spike_preview_thread on why this can't just return on error.
         rgb, actual_wh = None, None
@@ -3732,6 +3756,8 @@ class App:
             got_h, got_w = rgb.shape[:2]
 
             rgb = apply_cosmetics(rgb, *vals)
+            if hide_bg:
+                rgb = np.zeros_like(rgb)
             spike_enabled, stars, sparams, phys_enabled, pstars, pparams = spike_state
             if spike_enabled and stars:
                 layer = render_spike_layer((got_h, got_w), req_x, req_y, req_w, req_h,

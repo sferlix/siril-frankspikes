@@ -110,6 +110,53 @@ class TestPipeline(AppCase):
         a._compose_preview()
         self.assertTrue(np.allclose(a._preview_rgb, fs.apply_spikes(base, l1)))
 
+    def test_hide_background_composes_layers_onto_black(self):
+        a = self.app
+        base = np.full((20, 20, 3), 0.4, np.float32)
+        l1 = np.full((20, 20, 3), 0.2, np.float32)
+        l2 = np.full((20, 20, 3), 0.3, np.float32)
+        a._base_preview_rgb, a._spike_layer_preview, a._phys_layer_preview = base, l1, l2
+        a.spike_enabled.set(True)
+        a.phys_enabled.set(True)
+        black = np.zeros_like(base)
+        a.hide_background.set(True)
+        a._compose_preview()
+        self.assertTrue(np.allclose(a._preview_rgb, fs.apply_spikes(fs.apply_spikes(black, l1), l2)))
+        self.assertFalse(np.allclose(a._preview_rgb, fs.apply_spikes(fs.apply_spikes(base, l1), l2)))
+        a.hide_background.set(False)
+        a._compose_preview()
+        self.assertTrue(np.allclose(a._preview_rgb, fs.apply_spikes(fs.apply_spikes(base, l1), l2)))
+
+    def test_hide_background_toggle_is_cheap_no_rerender(self):
+        """Toggling should recompose the already-cached layers, not trigger
+        a fresh (expensive) spike render."""
+        a = self.app
+        a.loaded = True
+        a.full_shape = (30, 30)
+        a._base_preview_rgb = np.full((30, 30, 3), 0.5, np.float32)
+        a._spike_layer_preview = np.full((30, 30, 3), 0.1, np.float32)
+        a._spike_layer_key = "unchanged"
+        a.hide_background.set(True)
+        a._on_hide_background_toggle()
+        self.assertEqual(a._spike_layer_key, "unchanged")
+        self.assertTrue(np.allclose(a._preview_rgb, fs.apply_spikes(np.zeros((30, 30, 3), np.float32),
+                                                                     a._spike_layer_preview)))
+
+    def test_process_thread_ignores_hide_background(self):
+        """The flag is preview-only: _process_thread must build rgb_final
+        from the real pristine image regardless of hide_background."""
+        a = self.app
+        a.hide_background.set(True)
+        a._pristine_full = np.full((10, 10, 3), 0.6, np.float32)
+        a.full_shape = (10, 10)
+        a._stars = []
+        a.spike_enabled.set(False)
+        a.phys_enabled.set(False)
+        a.worker.get_shape = lambda: (10, 10)
+        a.worker.push_rgb = lambda rgb: setattr(a, "_pushed", rgb.copy())
+        a._process_thread()
+        self.assertTrue(np.allclose(a._pushed, 0.6))
+
     def test_preview_thread_renders_both_layers(self):
         a = self.app
         a.loaded = True
