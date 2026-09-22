@@ -48,6 +48,10 @@ Diffraction Spikes (panel to the right of the preview)
      never changes between re-renders) - breaks up the "stamped/CGI" look
      of many similar-size stars all rendering pixel-identical spikes.
      0 = perfectly formulaic, matching every star's raw parameters exactly.
+   - Twinkle: a tiny, fixed hint of spike on every star below the Minimum
+     diameter/Small anchor, instead of nothing - real photos never show a
+     hard cutoff, even faint stars show a small sparkle. Much weaker than
+     any real anchor's own look; 0 = the old hard cutoff.
    - Brightness also follows the star's own amplitude on top of its size
      (with a floor so ordinary stars aren't crushed to invisibility next to
      the single brightest one in the field), and rays stay strong for most
@@ -115,7 +119,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import sirilpy as s
 from sirilpy import SirilConnectionError
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -200,16 +204,27 @@ SPIKE_DEFAULTS = {
     "hue": 0.0,
     "sharpness": 100.0,
     "variation": 15.0,
+    # A real photo never truly zeroes a star out below some size threshold -
+    # even faint ones show a tiny hint of a cross (see the analysis in the
+    # commit that added this). "Twinkle" gives every star below the current
+    # Minimum diameter/Small anchor that same small, fixed hint instead of
+    # nothing, independent of Simple/Per-size and much weaker than any real
+    # anchor's own look (see TWINKLE_* below). 0 reproduces frankSpikes 2.1's
+    # hard cutoff exactly.
+    "twinkle": 20.0,
     "anchors": [
         {"diam": 3.0, "length": 2.0, "intensity": 40.0, "thickness": 0.8,
          "soft_flare": 0.0, "flare_tail": 0.0, "ring_flare": 0.0, "chroma": 0.0,
          "rainbow": 0.0, "saturation": 0.0},
         {"diam": 8.0, "length": 4.0, "intensity": 110.0, "thickness": 1.1,
          "soft_flare": 11.0, "flare_tail": 0.0, "ring_flare": 7.0, "chroma": 21.0,
-         "rainbow": 21.0, "saturation": 0.0},
+         # A real reference photo's spikes stay close to the star's own
+         # colour with at most a mild shift (see chroma above) - no cycling
+         # multi-hue "rainbow" by default. The slider itself stays available.
+         "rainbow": 0.0, "saturation": 0.0},
         {"diam": 18.0, "length": 6.5, "intensity": 170.0, "thickness": 1.6,
          "soft_flare": 35.0, "flare_tail": 0.0, "ring_flare": 20.0, "chroma": 45.0,
-         "rainbow": 35.0, "saturation": 55.0},
+         "rainbow": 0.0, "saturation": 55.0},
     ],
 }
 
@@ -959,9 +974,21 @@ def _add_soft_flare(layer, cx, cy, radius_px, peak, tail_len_px=0.0):
     layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
 
 
+def ring_width_for_radius(ring_radius_px, fwhm_px):
+    """Gaussian width (sigma) of the ring flare, given its own radius. A real
+    reference photo shows no separate ring shape at all - the halo around a
+    star is one smooth, continuous gradient - so the width scales with the
+    ring's OWN radius (a broad fraction of it) rather than a small fixed
+    fraction of the star's fwhm; that turns what used to render as a crisp
+    thin circle into a soft brightness bump that blends into the core and
+    soft flare instead of reading as a separate ring."""
+    return max(0.8, ring_radius_px * 0.55, fwhm_px * 0.15)
+
+
 def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak):
-    """A thin bright ring around the star at a fixed radius, like the first
-    diffraction ring caused by the secondary-mirror obstruction."""
+    """A soft brightening around the star at roughly this radius, blended
+    into the surrounding glow rather than a crisp separate ring - see
+    ring_width_for_radius for why the width scales the way it does."""
     if ring_radius_px < 1.0 or peak <= 0:
         return
     h, w, _ = layer.shape
@@ -987,6 +1014,16 @@ def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak):
 
 _ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare", "flare_tail",
                       "ring_flare", "chroma", "rainbow", "saturation")
+
+# "Twinkle" look for a star below the Minimum diameter/Small anchor (see
+# SPIKE_DEFAULTS["twinkle"]): deliberately weaker than any real anchor's own
+# length/intensity (Small is length=2.0/intensity=40) so it reads as a hint,
+# not a fully-rendered small star - just the bare rays, no flare/colour extras.
+TWINKLE_LENGTH_MULT = 2.5        # x star diameter - long enough to clear the
+                                  # star's own core (otherwise it's invisible,
+                                  # swallowed by the core's own bright disc)
+TWINKLE_INTENSITY_SCALE = 1.0    # intensity = twinkle slider (0-100) * this
+TWINKLE_THICKNESS = 0.5
 
 
 def _smoothstep(t):
@@ -1071,8 +1108,9 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
 
     anchors_sorted = sorted(cfg["anchors"], key=lambda a: a["diam"])
     min_diameter = anchors_sorted[0]["diam"]
+    twinkle = max(0.0, min(100.0, cfg.get("twinkle", 0.0)))
     has_overrides = any(ov is not None for (*_rest, ov) in stars)
-    if (not has_overrides and
+    if (not has_overrides and twinkle <= 0 and
             max(a["intensity"] for a in anchors_sorted) <= 0 and
             max(a["soft_flare"] for a in anchors_sorted) <= 0 and
             max(a["ring_flare"] for a in anchors_sorted) <= 0):
@@ -1091,7 +1129,12 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
         if override is not None:
             p = override
         elif fwhm < min_diameter and not forced:
-            continue
+            if twinkle <= 0:
+                continue
+            # A tiny fixed hint instead of nothing - see TWINKLE_* above.
+            p = {"length": TWINKLE_LENGTH_MULT, "intensity": twinkle * TWINKLE_INTENSITY_SCALE,
+                 "thickness": TWINKLE_THICKNESS, "soft_flare": 0.0, "flare_tail": 0.0,
+                 "ring_flare": 0.0, "chroma": 0.0, "rainbow": 0.0, "saturation": 100.0}
         else:
             # Forced stars smaller than the smallest anchor use that
             # anchor's look exactly (clamped), never an extrapolation past
@@ -1164,7 +1207,7 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
             # spikes are short or disabled.
             ring_radius_px = min(fwhm * 1.8 * scale,
                                   max(ray_len_px * 0.6, fwhm * 1.0 * scale))
-            ring_width_px = max(0.8, fwhm * 0.3 * scale)
+            ring_width_px = ring_width_for_radius(ring_radius_px, fwhm * scale)
             if ring_radius_px >= 1.5:
                 ring_peak = (p["ring_flare"] / 100.0) * rel_amp * 0.7
                 _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, ring_peak)
@@ -1428,10 +1471,12 @@ class App:
         self.spike_hue = tk.DoubleVar(value=d["hue"])
         self.spike_sharpness = tk.DoubleVar(value=d["sharpness"])
         self.spike_variation = tk.DoubleVar(value=d["variation"])
+        self.spike_twinkle = tk.DoubleVar(value=d["twinkle"])
         self.spike_rotation_label = tk.StringVar(value=f"{d['rotation']:.0f}")
         self.spike_hue_label = tk.StringVar(value=f"{d['hue']:.0f}")
         self.spike_sharpness_label = tk.StringVar(value=f"{d['sharpness']:.0f}")
         self.spike_variation_label = tk.StringVar(value=f"{d['variation']:.0f}")
+        self.spike_twinkle_label = tk.StringVar(value=f"{d['twinkle']:.0f}")
 
         # One dict per size anchor (Small/Medium/Large), each holding a
         # tk.DoubleVar + tk.StringVar label per key in SPIKE_ANCHOR_PARAM_DEFS
@@ -1825,12 +1870,15 @@ class App:
         self._add_slider(frm_spikes, 10, "Natural variation (per-star jitter)",
                           self.spike_variation, self.spike_variation_label, 0, 100,
                           step=5, on_change=self._on_spike_slider)
+        self._add_slider(frm_spikes, 12, "Twinkle (a tiny hint of spike below the minimum diameter)",
+                          self.spike_twinkle, self.spike_twinkle_label, 0, 100,
+                          step=5, on_change=self._on_spike_slider)
 
         # ---- Per-size-anchor look: a tab per anchor, each with the full
         # set of size-dependent controls, generated from SPIKE_ANCHOR_PARAM_DEFS
         # so this stays one loop instead of ~30 hand-written slider calls. ----
         self._spike_notebook = ttk.Notebook(frm_spikes)
-        self._spike_notebook.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_notebook.grid(row=14, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
         for tab_index, (tab_label, anchor_vars) in enumerate(
                 zip(SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors)):
             tab = ttk.Frame(self._spike_notebook, style="Card.TFrame")
@@ -1847,7 +1895,7 @@ class App:
         # would have, plus the cutoff diameter, gridded in the same cell as
         # the notebook above - only one of the two is ever shown. ----
         self._spike_uniform_frame = ttk.Frame(frm_spikes, style="Card.TFrame")
-        self._spike_uniform_frame.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_uniform_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
         self._spike_uniform_frame.grid_columnconfigure(0, minsize=200)
         u_lo, u_hi = SPIKE_ANCHOR_DIAM_RANGES[0]
         self._add_slider(self._spike_uniform_frame, 0, "Minimum star diameter (px)",
@@ -1866,7 +1914,7 @@ class App:
         # panel above whenever a star is Shift+Click-selected - same 8
         # sliders, but they read/write that one star's own override. ----
         self._spike_star_frame = ttk.Frame(frm_spikes, style="Card.TFrame")
-        self._spike_star_frame.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_star_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
         self._spike_star_frame.grid_columnconfigure(0, minsize=200)
         ttk.Label(self._spike_star_frame, textvariable=self.spike_star_info,
                   style="Card.TLabel", justify="left", wraplength=210).grid(
@@ -1906,13 +1954,13 @@ class App:
                        "or empty space / Deselect to stop editing a single star.")
         self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
         self._spike_help_label.grid(
-            row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+            row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
         ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
                    command=self._reset_spike_edits).grid(
-            row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+            row=16, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
         ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
                    command=self._reset_spike_defaults).grid(
-            row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+            row=17, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
         self._update_spike_mode_ui()
 
         # ---- Status bar ----
@@ -2140,6 +2188,7 @@ class App:
         self.spike_sharpness_label.set(f"{self.spike_sharpness.get():.0f}")
         self.spike_hue_label.set(f"{self.spike_hue.get():.0f}")
         self.spike_variation_label.set(f"{self.spike_variation.get():.0f}")
+        self.spike_twinkle_label.set(f"{self.spike_twinkle.get():.0f}")
         self.spike_uniform_min_diam_label.set(f"{self.spike_uniform_min_diam.get():.0f}")
         for key, _label, _lo, _hi, _step, fmt in SPIKE_ANCHOR_PARAM_DEFS:
             for av in self.spike_anchors:
@@ -2212,6 +2261,7 @@ class App:
             "hue": self.spike_hue.get(),
             "sharpness": self.spike_sharpness.get(),
             "variation": self.spike_variation.get(),
+            "twinkle": self.spike_twinkle.get(),
         }
 
     def _uniform_anchors(self):
@@ -2281,6 +2331,7 @@ class App:
         self.spike_hue.set(d["hue"])
         self.spike_sharpness.set(d["sharpness"])
         self.spike_variation.set(d["variation"])
+        self.spike_twinkle.set(d["twinkle"])
         for av, defaults in zip(self.spike_anchors, d["anchors"]):
             for key, *_ in SPIKE_ANCHOR_PARAM_DEFS:
                 av[key].set(defaults[key])
