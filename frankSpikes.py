@@ -450,6 +450,17 @@ def to_hwc(arr):
 
 def to_float01(arr):
     if arr.dtype == np.uint16:
+        # Siril's "16 bits" working mode stores an originally-8-bit source (e.g.
+        # a JPG) as a uint16 array whose values are never rescaled past 0-255 -
+        # only the numpy dtype says "16-bit", not the actual data (confirmed via
+        # a user report: fetch_full() came back with max=0.00389 == 255/65535,
+        # i.e. an 8-bit image divided by the wrong denominator, ~256x too dark,
+        # rendering as solid black once composited/downsampled). A genuine
+        # 16-bit astro image essentially never tops out under 256 - real sensor
+        # data uses far more of the range - so this is a safe, low-risk way to
+        # tell the two apart without needing Siril's own bit-depth metadata.
+        if arr.max() <= 255:
+            return arr.astype(np.float32) / 255.0
         return arr.astype(np.float32) / 65535.0
     if arr.dtype == np.uint8:
         return arr.astype(np.float32) / 255.0
