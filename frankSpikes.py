@@ -173,7 +173,7 @@ except ImportError:
     class SirilConnectionError(Exception):
         pass
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -259,7 +259,7 @@ def spike_anchor_slider_range(tab_index, key):
     if key == "diam":
         return SPIKE_ANCHOR_DIAM_RANGES[tab_index]
     lo, hi = _SPIKE_ANCHOR_PARAM_FULL_RANGE[key]
-    if key in _SPIKE_GEOMETRY_KEYS:
+    if key in _SPIKE_GEOMETRY_KEYS or key in _SPIKE_COLOUR_KEYS:
         return lo, hi
     return lo, lo + (hi - lo) * SPIKE_ANCHOR_LOOK_SCALE[tab_index]
 
@@ -2231,6 +2231,11 @@ def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak,
 _SPIKE_GEOMETRY_KEYS = ("flare_reach", "ring_diam")
 SPIKE_FLARE_REACH_DEFAULT = 45.0   # % of the spike length
 SPIKE_RING_DIAM_DEFAULT = 1.6      # x star diameter - just past the star's edge
+# Colour purity, not strength: how much of the star's own colour the rays
+# and flares show is a property of the star, not something a smaller star
+# should get less range for, so these also keep the full slider range on
+# every Per size tab (no SPIKE_ANCHOR_LOOK_SCALE ceiling).
+_SPIKE_COLOUR_KEYS = ("saturation", "flare_saturation")
 
 _ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare", "flare_reach",
                       "flare_rays", "ring_flare", "ring_diam",

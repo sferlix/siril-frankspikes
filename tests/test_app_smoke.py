@@ -160,6 +160,15 @@ class TestSimpleModeKeepsFlareGeometry(AppCase):
         self.assertEqual(fs.spike_anchor_slider_range(0, "flare_reach"),
                          fs._SPIKE_ANCHOR_PARAM_FULL_RANGE["flare_reach"])
 
+    def test_colour_keys_get_the_full_range_on_every_tab(self):
+        for tab in range(3):
+            for key in ("saturation", "flare_saturation"):
+                self.assertEqual(fs.spike_anchor_slider_range(tab, key),
+                                 fs._SPIKE_ANCHOR_PARAM_FULL_RANGE[key])
+        # strengths keep the narrower Small ceiling
+        self.assertLess(fs.spike_anchor_slider_range(0, "intensity")[1],
+                        fs._SPIKE_ANCHOR_PARAM_FULL_RANGE["intensity"][1])
+
 
 class TestToneResetButton(AppCase):
     """The left panel's own "Reset" button (separate from the Diffraction

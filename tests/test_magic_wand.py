@@ -233,6 +233,11 @@ class TestMagicWandFocalAndSpikes(unittest.TestCase):
         self.assertLessEqual(cut_short, cut_long)
         self.assertLessEqual(cut_long, 8.0)
 
+    def test_small_stars_keep_the_full_colour_saturation(self):
+        _g, anchors, _s, info = fs.magic_wand_spikes(300.0, _stars(np.linspace(2, 40, 200)), 30.0)
+        self.assertEqual([a["saturation"] for a in anchors], [70.0, 70.0, 70.0])
+        self.assertNotIn("Small stars saturation", info["clamped"])
+
     def test_a_shared_size_is_not_let_in_as_a_block(self):
         fw = [4.0] * 95 + [10.0] * 5
         cutoff = fs.magic_wand_spikes(35.0, _stars(fw), 30.0)[1][0]["diam"]
