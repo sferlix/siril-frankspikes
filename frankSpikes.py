@@ -1198,7 +1198,7 @@ def detect_saturated_stars(full_rgb, existing_stars, bright_floor=0.90,
 
 
 # ---------------------------------------------------------------------------
-# Standalone (no Siril) mode: FITS/TIFF file I/O and star detection, used by
+# Standalone (no Siril) mode: FITS/TIFF/JPG/PNG file I/O and star detection, used by
 # FileWorker in place of sirilpy's pixeldata/get_image_stars calls. Kept as
 # free functions (not methods) so they're independently testable, and all
 # three extra imports (astropy, photutils, tifffile) are lazy - a Siril-
@@ -1312,6 +1312,44 @@ def _save_tiff(path, rgb_display, bit_depth):
     else:
         data = arr.astype(np.float32)
     tifffile.imwrite(path, data)
+
+
+# Everyday 8-bit formats, read/written with Pillow (already a dependency) -
+# handy for a quick edit of a finished, already-stretched JPG/PNG. Being
+# 8-bit (16-bit only for greyscale PNG) and without FITS headers, there's no
+# focal length to calibrate the spike defaults from.
+_FITS_EXTS = (".fit", ".fits", ".fts")
+_TIFF_EXTS = (".tif", ".tiff")
+_RASTER_EXTS = (".jpg", ".jpeg", ".png")
+_SUPPORTED_EXTS_MSG = ".fits/.fit/.fts, .tif/.tiff, .jpg/.jpeg or .png"
+
+
+def _load_raster(path):
+    """Loads a JPG/PNG into the same "raw" (H,W,3) float01 contract as
+    _load_tiff() - also stored row 0 = top on disk, so flipped the same
+    way. Honours the EXIF orientation tag (phone/camera JPGs), drops alpha,
+    and keeps a 16-bit greyscale PNG's full range."""
+    from PIL import ImageOps
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("I;16", "I;16L", "I;16B", "I"):
+            arr = np.clip(np.asarray(im), 0, 65535).astype(np.uint16)
+            arr = np.stack([arr, arr, arr], axis=-1)
+        else:
+            arr = np.asarray(im.convert("RGB"))
+    return to_float01(arr)[::-1, :, :]  # top-down (native) -> raw (bottom-up)
+
+
+def _save_raster(path, rgb_display):
+    """rgb_display is (H,W,3) float01 in display convention (row 0 = top),
+    already JPG/PNG's own raster order. Always 8-bit; JPG at quality 95
+    with no chroma subsampling so fine coloured spikes don't bleed."""
+    data = (np.clip(rgb_display, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    im = Image.fromarray(data, "RGB")
+    if os.path.splitext(path)[1].lower() in (".jpg", ".jpeg"):
+        im.save(path, quality=95, subsampling=0)
+    else:
+        im.save(path)
 
 
 def _detect_stars_standalone(raw_rgb, max_stars=6000):
@@ -2272,7 +2310,7 @@ class SirilWorker:
 class FileWorker:
     """Standalone (no Siril) mode: same interface as SirilWorker (duck-typed
     - App only ever calls through self.worker, never checks which class it
-    is, except via the `standalone` flag), but reads/writes FITS or TIFF
+    is, except via the `standalone` flag), but reads/writes FITS, TIFF, JPG or PNG
     files directly instead of talking to a running Siril instance, and uses
     photutils in place of Siril's own 'findstar'.
 
@@ -2292,7 +2330,7 @@ class FileWorker:
         self._raw_rgb = None    # (H,W,3) float01, raw (row 0 = bottom) order
         self._shape = None      # (h, w)
         self._src_ext = None    # source file extension, used to pick a Save As default
-        self._focal_length = None  # mm, from the FITS header - None if unavailable (e.g. TIFF)
+        self._focal_length = None  # mm, from the FITS header - None if unavailable (TIFF/JPG/PNG)
         self.last_rgb = None    # most recent Process() result, display order - cached
         # for File > Save As (re-saving without recomputing) since App.push_rgb
         # can't itself open a file dialog (called from a background thread).
@@ -2316,23 +2354,24 @@ class FileWorker:
         return os.path.basename(self.path) if self.path else "(none)"
 
     def open_path(self, path):
-        """Loads a .fits/.fit/.fts or .tif/.tiff file - raises on failure
+        """Loads a FITS, TIFF, JPG or PNG file - raises on failure
         (an unsupported extension, a missing optional dependency, or a file
         the library itself can't parse), left to the caller (App._on_open_file,
         on the main thread) to report via a message box."""
         ext = os.path.splitext(path)[1].lower()
-        if ext in (".fit", ".fits", ".fts"):
+        if ext in _FITS_EXTS:
             arr = _load_fits(path)
-        elif ext in (".tif", ".tiff"):
+        elif ext in _TIFF_EXTS:
             arr = _load_tiff(path)
+        elif ext in _RASTER_EXTS:
+            arr = _load_raster(path)
         else:
-            raise ValueError(f"Unsupported file type {ext!r} - expected "
-                              f".fits/.fit/.fts or .tif/.tiff")
+            raise ValueError(f"Unsupported file type {ext!r} - expected {_SUPPORTED_EXTS_MSG}")
         self.path = path
         self._raw_rgb = arr
         self._shape = arr.shape[:2]
         self._src_ext = ext
-        self._focal_length = _read_fits_focal_length(path) if ext in (".fit", ".fits", ".fts") else None
+        self._focal_length = _read_fits_focal_length(path) if ext in _FITS_EXTS else None
 
     def get_focal_length(self):
         return self._focal_length
@@ -2356,21 +2395,21 @@ class FileWorker:
 
     def save_rgb(self, rgb_float01, path, bit_depth=None):
         """Writes rgb_float01 (display order, row 0 = top) to `path` as
-        FITS or TIFF, picked by its extension. bit_depth defaults to 32
+        FITS, TIFF, JPG or PNG, picked by its extension. bit_depth defaults to 32
         (float) for FITS - the standard lossless astro interchange depth -
-        and 16 (unsigned) for TIFF, unless the source file's own depth
-        suggests otherwise isn't needed here since the caller (App) always
-        passes an explicit choice from its Save As dialog."""
+        and 16 (unsigned) for TIFF; JPG/PNG are always 8-bit (bit_depth is
+        ignored for them)."""
         ext = os.path.splitext(path)[1].lower()
         if bit_depth is None:
             bit_depth = 32 if ext in (".fit", ".fits", ".fts") else 16
-        if ext in (".fit", ".fits", ".fts"):
+        if ext in _FITS_EXTS:
             _save_fits(path, rgb_float01, bit_depth)
-        elif ext in (".tif", ".tiff"):
+        elif ext in _TIFF_EXTS:
             _save_tiff(path, rgb_float01, bit_depth)
+        elif ext in _RASTER_EXTS:
+            _save_raster(path, rgb_float01)
         else:
-            raise ValueError(f"Unsupported file type {ext!r} - expected "
-                              f".fits/.fit/.fts or .tif/.tiff")
+            raise ValueError(f"Unsupported file type {ext!r} - expected {_SUPPORTED_EXTS_MSG}")
 
 
 class App:
@@ -2487,6 +2526,12 @@ class App:
         # (see render_spike_layer). Cleared on Reload and by "Reset manual
         # edits", same lifecycle as _spike_disabled/_spike_forced/_spike_manual.
         self._spike_star_overrides = {}
+        # Standalone "unsaved changes" tracking (see _has_unsaved_changes):
+        # the edit signature the file on disk matches (taken right after
+        # loading, then after every successful save), and the one the last
+        # Process result was rendered with.
+        self._saved_sig = None
+        self._processed_sig = None
         self._selected_star_key = None  # the ("auto"|"manual", id) currently
         # selected for editing, or None - drives which slider panel shows
         # (see _update_spike_mode_ui) and the dashed-circle highlight.
@@ -2543,10 +2588,41 @@ class App:
         self.root.after(100, self._poll_queue)
         self.root.after(150, self._on_reload)
 
+    def _edit_signature(self):
+        """Everything the user can change about the result - tone sliders,
+        the spike settings actually rendered and per-star edits - as one
+        comparable value (see _has_unsaved_changes)."""
+        tone = sorted((k, v.get()) for k, v in self.tone.items() if not k.endswith("_label"))
+        return repr((tone, self.spike_enabled.get(), self._spike_config(),
+                     sorted(self._spike_disabled), sorted(self._spike_forced),
+                     self._spike_manual,
+                     sorted(self._spike_star_overrides.items(), key=repr)))
+
+    def _has_unsaved_changes(self):
+        """Standalone mode only (in Siril the image lives in Siril, which
+        handles its own saving): an image is open and its current edits
+        differ from what was last saved to disk (or from the untouched
+        file, if nothing was saved yet)."""
+        return (self.worker.standalone and self.loaded and self._saved_sig is not None
+                and self._edit_signature() != self._saved_sig)
+
+    def _confirm_discard(self, action):
+        """True if it's fine to go ahead with `action` (e.g. "Close"),
+        asking first when there are unsaved changes."""
+        if not self._has_unsaved_changes():
+            return True
+        return messagebox.askyesno(
+            "Unsaved changes",
+            f'"{self.active_filename.get()}" has changes that haven\'t been saved.\n\n'
+            f"{action} without saving?",
+            icon="warning", default="no")
+
     def _on_close(self):
         """Safety net: get_stars() already clears the star overlay right
         after detection, but make sure closing the window never leaves
         every star selected on the image in Siril."""
+        if not self._confirm_discard("Close"):
+            return
         try:
             self.worker.clear_stars()
         except Exception:
@@ -3103,11 +3179,15 @@ class App:
     # ---------- Standalone mode: Open/Save (main thread - file dialogs
     # can't be opened from a background thread) ----------
     def _on_open_file(self):
+        if not self._confirm_discard("Open another image"):
+            return
         path = filedialog.askopenfilename(
             title="Open image",
-            filetypes=[("FITS/TIFF images", "*.fits *.fit *.fts *.tif *.tiff"),
+            filetypes=[("Images", "*.fits *.fit *.fts *.tif *.tiff *.jpg *.jpeg *.png"),
                        ("FITS", "*.fits *.fit *.fts"),
                        ("TIFF", "*.tif *.tiff"),
+                       ("JPEG", "*.jpg *.jpeg"),
+                       ("PNG", "*.png"),
                        ("All files", "*.*")])
         if not path:
             return
@@ -3128,18 +3208,22 @@ class App:
         finishes - the equivalent of Siril mode's "applies directly to the
         active image", since there's no live image here to apply to."""
         base = os.path.splitext(self.active_filename.get())[0]
-        default_ext = self.worker._src_ext if self.worker._src_ext in (".fits", ".fit", ".tif", ".tiff") else ".fits"
+        src_ext = self.worker._src_ext
+        default_ext = src_ext if src_ext in _FITS_EXTS + _TIFF_EXTS + _RASTER_EXTS else ".fits"
         path = filedialog.asksaveasfilename(
             title="Save processed image",
             initialfile=f"{base}_frankSpikes{default_ext}",
             defaultextension=default_ext,
-            filetypes=[("FITS", "*.fits *.fit *.fts"), ("TIFF", "*.tif *.tiff")])
+            filetypes=[("FITS", "*.fits *.fit *.fts"), ("TIFF", "*.tif *.tiff"),
+                       ("JPEG", "*.jpg *.jpeg"), ("PNG", "*.png")])
         if not path:
             self.status.set("Process complete - not saved.")
             return
         try:
             self.worker.save_rgb(rgb_display, path)
             self.status.set(f"Saved: {path}")
+            # the file now matches the edits that result was rendered with
+            self._saved_sig = self._processed_sig
         except Exception as e:
             messagebox.showerror("Save failed", format_error(e))
 
@@ -4442,6 +4526,7 @@ class App:
 
     # ---------- Process (full resolution, background thread) ----------
     def _on_process(self):
+        self._processed_sig = self._edit_signature()
         self.btn_process.config(state="disabled")
         self._busy_begin()
         self._siril_busy = True
@@ -4518,6 +4603,10 @@ class App:
                         self._apply_thickness_calibration(thickness_scale)
                     if intensity_scale is not None:
                         self._apply_intensity_calibration(intensity_scale)
+                    # the freshly opened file, with the automatic
+                    # calibration above, counts as "nothing to save"
+                    self._saved_sig = self._edit_signature()
+                    self._processed_sig = None
                     self._busy_end()
                     self.btn_process.config(state="normal")
                     self._render_preview()

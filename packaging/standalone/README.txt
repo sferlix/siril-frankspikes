@@ -6,7 +6,7 @@ Cos'e'
 frankSpikes aggiunge spike di diffrazione realistici (e regolazioni di
 luce/colore) a una singola immagine astrofotografica. Questa versione
 funziona da sola, senza bisogno di avere Siril aperto: apri direttamente
-un file FITS o TIFF, regoli con gli slider, e salvi il risultato.
+un file FITS, TIFF, JPG o PNG, regoli con gli slider, e salvi il risultato.
 
 Come si usa
 -----------
@@ -21,8 +21,10 @@ Come si usa
      dentro questa stessa cartella (".venv") - non toccano altre
      installazioni Python sul computer.
 3. Nella finestra di frankSpikes: File -> Apri... per caricare
-   un'immagine (.fits/.fit/.fts o .tif/.tiff), regola gli slider, poi
+   un'immagine (.fits/.fit/.fts, .tif/.tiff, .jpg/.jpeg o .png), regola gli slider, poi
    "Process and Save As..." per salvare il risultato.
+   Se chiudi la finestra (o apri un'altra immagine) con modifiche non
+   ancora salvate, frankSpikes chiede prima una conferma.
 
 Note
 ----

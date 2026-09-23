@@ -113,7 +113,7 @@ class TestFileWorkerContract(unittest.TestCase):
     def test_open_path_rejects_unsupported_extension(self):
         w = fs.FileWorker()
         with self.assertRaises(ValueError):
-            w.open_path("not_an_image.png")
+            w.open_path("not_an_image.bmp")
 
     def test_get_stars_y_is_flipped_to_display_convention(self):
         """get_stars() must return y in DISPLAY (top-down) convention, the

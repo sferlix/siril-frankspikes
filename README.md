@@ -48,12 +48,13 @@ Realistic star spikes as produced by a reflector's secondary-mirror spider:
 
 ## Standalone mode (no Siril required)
 
-frankSpikes also runs on its own, without Siril open at all — useful for editing a FITS or TIFF file directly, or on a machine without Siril installed. Launching the script with no Siril connection available automatically switches it to standalone mode:
+frankSpikes also runs on its own, without Siril open at all — useful for editing a FITS, TIFF, JPG or PNG file directly, or on a machine without Siril installed. Launching the script with no Siril connection available automatically switches it to standalone mode:
 
-- **File → Open...** (Ctrl+O) loads a `.fits`/`.fit`/`.fts` or `.tif`/`.tiff` file directly from disk
+- **File → Open...** (Ctrl+O) loads a `.fits`/`.fit`/`.fts`, `.tif`/`.tiff`, `.jpg`/`.jpeg` or `.png` file directly from disk. JPG/PNG are 8-bit (16-bit only for greyscale PNG) and carry no focal length, so the spike defaults aren't focal-length calibrated for them
 - Star detection uses [photutils](https://photutils.readthedocs.io/)' `DAOStarFinder` in place of Siril's own `findstar`
-- The button becomes **Process and Save As...**: it renders the result, then opens a Save dialog (FITS or TIFF, picked by the extension you type/choose) instead of pushing into a live Siril image
+- The button becomes **Process and Save As...**: it renders the result, then opens a Save dialog (FITS, TIFF, JPG or PNG, picked by the extension you type/choose; JPG/PNG are saved 8-bit, JPG at quality 95) instead of pushing into a live Siril image
 - **File → Save As...** (Ctrl+S) re-exports the last processed result without recomputing, e.g. to save a second copy in another format
+- Closing the window, or opening another image, with edits that haven't been saved yet asks for confirmation first
 
 Standalone mode needs a few packages beyond the Siril-connected mode's `numpy`/`Pillow`:
 
