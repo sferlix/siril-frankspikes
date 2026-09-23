@@ -173,7 +173,7 @@ except ImportError:
     class SirilConnectionError(Exception):
         pass
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -259,7 +259,7 @@ def spike_anchor_slider_range(tab_index, key):
     if key == "diam":
         return SPIKE_ANCHOR_DIAM_RANGES[tab_index]
     lo, hi = _SPIKE_ANCHOR_PARAM_FULL_RANGE[key]
-    if key in _SPIKE_GEOMETRY_KEYS:
+    if key in _SPIKE_GEOMETRY_KEYS or key in _SPIKE_COLOUR_KEYS:
         return lo, hi
     return lo, lo + (hi - lo) * SPIKE_ANCHOR_LOOK_SCALE[tab_index]
 
@@ -1483,12 +1483,24 @@ def _measure_bright_star_profile(luma, x, y, peak, r=25):
     outer = patch[rad > r * 0.7]
     bg = float(np.median(outer)) if outer.size else float(np.median(patch))
     half = bg + max(peak - bg, 1e-6) / 2.0
+    # Half-max radius interpolated between whole-pixel ring centres (the
+    # peak itself at radius 0) - taking the first ring below half as-is
+    # (its outer edge, a whole number) used to report even-integer sizes,
+    # about twice too big for small stars (a 3.2px star read as 6px).
     half_r = float(r)
+    prev_r, prev_v = 0.0, float(peak)
     for radius in range(1, r):
         ring = patch[(rad >= radius - 1) & (rad < radius)]
-        if ring.size and float(ring.mean()) < half:
-            half_r = float(radius)
+        if not ring.size:
+            continue
+        cur_r = float(np.mean(rad[(rad >= radius - 1) & (rad < radius)]))
+        cur_v = float(ring.mean())
+        if cur_v < half:
+            span = prev_v - cur_v
+            frac = (prev_v - half) / span if span > 1e-9 else 0.5
+            half_r = prev_r + float(np.clip(frac, 0.0, 1.0)) * (cur_r - prev_r)
             break
+        prev_r, prev_v = cur_r, cur_v
     fwhm = max(1.5, half_r * 2.0)
     amplitude = max(1e-6, peak - bg)
     return fwhm, amplitude
@@ -2219,6 +2231,11 @@ def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak,
 _SPIKE_GEOMETRY_KEYS = ("flare_reach", "ring_diam")
 SPIKE_FLARE_REACH_DEFAULT = 45.0   # % of the spike length
 SPIKE_RING_DIAM_DEFAULT = 1.6      # x star diameter - just past the star's edge
+# Colour purity, not strength: how much of the star's own colour the rays
+# and flares show is a property of the star, not something a smaller star
+# should get less range for, so these also keep the full slider range on
+# every Per size tab (no SPIKE_ANCHOR_LOOK_SCALE ceiling).
+_SPIKE_COLOUR_KEYS = ("saturation", "flare_saturation")
 
 _ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare", "flare_reach",
                       "flare_rays", "ring_flare", "ring_diam",
