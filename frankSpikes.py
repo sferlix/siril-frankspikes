@@ -139,7 +139,8 @@ HOW TO USE IT
    stacking on the previous result). Saving or undoing any of those
    results is done in Siril itself (File > Save, Ctrl+Z), exactly like any
    other Siril step - each Process pushes its own undo checkpoint there.
-   Close the window whenever you're happy with the result.
+   Close the window whenever you're happy with the result - if some
+   edits haven't been applied to Siril yet, it asks before closing.
 """
 
 import os
@@ -172,7 +173,7 @@ except ImportError:
     class SirilConnectionError(Exception):
         pass
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -804,6 +805,390 @@ def compute_auto_tone(rgb):
     whites = max(-100.0, min(100.0, whites))
 
     return {"temperature": temperature, "tint": tint, "blacks": blacks, "whites": whites}
+
+
+
+# ---------------------------------------------------------------------------
+# Magic Wands - two buttons, one job each: the Camera RAW one (left panel)
+# only touches the tone sliders, the spike one (spike panel, also run
+# automatically when an image loads) only the spike sliders.
+# Tone: a conservative finishing pass for an ALREADY-PROCESSED image -
+# analyse it (background cast/level, saturated cores, noise, colour) and set:
+#   Temperature/Tint and Blacks/Whites from an automatic white balance on
+#   the sky and black/white points (compute_auto_tone; the black point
+#   solved after Shadows so the sky stays dark), plus Highlights -5..-15
+#   (protect cores), Shadows +5..+12 and Texture +5..+10 (less when
+#   noisy), Clarity/Dehaze 0, Vibrance +8..+15, Saturation 0.
+# Spikes (Per size mode - see magic_wand_spikes), scaled by the declared or
+#   estimated focal length: Minimum diameter 3 (short) -> 10px
+#   (long, but only the ~12% biggest stars ever pass), Sharpness 95 -> 55, Length 12x -> 8x, Intensity 130 -> 165,
+#   Thickness 0.6 -> 1.0, plus fixed Natural variation 15, Twinkle 15,
+#   Diffraction rainbow 40, Color saturation 70, Soft flare 15, Flare
+#   reach 40%.
+# Everything is measured on the untouched source, so pressing it twice
+# gives the same result. Pure functions below; App._on_magic_wand and
+# App._apply_spike_wand apply them.
+# ---------------------------------------------------------------------------
+
+# Focal-length scale of the spike mapping: t = 0 at/below the short end,
+# 1 at/above the long end, log-interpolated in between.
+MAGIC_WAND_FOCAL_SHORT_MM = 50.0
+MAGIC_WAND_FOCAL_LONG_MM = 1000.0
+# Representative focal lengths for an ESTIMATED field type (no FOCALLEN).
+_FIELD_TYPE_FOCAL_MM = {"wide": 35.0, "medium": 300.0, "long": 1200.0}
+_FIELD_TYPE_LABEL = {"wide": "wide field / astro-landscape (< 100mm)",
+                     "medium": "medium field (100-750mm)",
+                     "long": "long-focal deep sky (> 750mm)"}
+
+
+def _field_type_for_focal(focal_mm):
+    if focal_mm < 100.0:
+        return "wide"
+    if focal_mm <= 750.0:
+        return "medium"
+    return "long"
+
+
+def estimate_field_type(focal_mm, stars, image_shape):
+    """(field_type, focal_mm, source, reasons): the declared focal length
+    (FITS FOCALLEN) when there is one, otherwise a rough guess from the
+    detected stars - how big they are (median FWHM in px) and how densely
+    they fill the frame, plus whether the bottom of the frame is nearly
+    starless (a landscape foreground). A pixel-based guess can't know the
+    real plate scale or seeing, so it's reported as an estimate of the
+    field TYPE, with its representative focal length, not a measurement."""
+    if focal_mm and focal_mm > 0:
+        ftype = _field_type_for_focal(float(focal_mm))
+        return ftype, float(focal_mm), "declared", [f"FOCALLEN = {focal_mm:.0f}mm in the file header"]
+    h, w = image_shape[:2]
+    reasons = []
+    if not stars:
+        return "medium", _FIELD_TYPE_FOCAL_MM["medium"], "estimated", ["no stars detected - assuming a medium field"]
+    fwhm = np.array([s[2] for s in stars], dtype=np.float64)
+    ys = np.array([s[1] for s in stars], dtype=np.float64)
+    med = float(np.median(fwhm))
+    density = len(stars) / max(h * w / 1e6, 1e-6)
+    n_top = int(np.count_nonzero(ys < 0.25 * h))
+    n_bottom = int(np.count_nonzero(ys > 0.75 * h))
+    reasons.append(f"median star FWHM {med:.1f}px, {density:.0f} detected stars per megapixel")
+    if n_top >= 20 and n_bottom < 0.25 * n_top:
+        reasons.append(f"nearly starless bottom quarter ({n_bottom} stars vs {n_top} at the top) "
+                       f"- looks like a landscape foreground")
+        ftype = "wide"
+    elif med <= 3.0 and density >= 250:
+        reasons.append("many small, tightly packed stars")
+        ftype = "wide"
+    elif med >= 5.0 or density < 60:
+        reasons.append("large and/or sparse stars")
+        ftype = "long"
+    else:
+        ftype = "medium"
+    return ftype, _FIELD_TYPE_FOCAL_MM[ftype], "estimated", reasons
+
+
+def _subsample(rgb, max_px=2_000_000):
+    h, w = rgb.shape[:2]
+    step = max(1, int(np.ceil(np.sqrt(h * w / max_px))))
+    return rgb[::step, ::step]
+
+
+def analyze_image_tone(full_rgb):
+    """Measurements the Camera RAW part of the Magic Wand is based on, all
+    on the untouched (H,W,3) float01 source: background (the darkest 40%
+    of pixels - mostly sky) level and colour cast, the share of near-
+    saturated pixels (star/galaxy/nebula cores), background noise relative
+    to its level (on a full-resolution crop - a downsampled preview hides
+    it), and the mean colour saturation of the brighter (subject) pixels."""
+    rgb = _subsample(np.asarray(full_rgb, dtype=np.float32))
+    luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    p40, p60 = np.percentile(luma, [40, 60])
+    bg = luma <= p40
+    bg_rgb = [float(np.mean(rgb[..., c][bg])) for c in range(3)]
+    bg_level = float(np.median(luma[bg]))
+    ref = max(bg_level, 0.02)
+    r, g, b = bg_rgb
+    # relative to the sky level, and zeroed when negligible in absolute
+    # terms (a "40% cast" on a nearly black sky is invisible)
+    green_cast = (g - (r + b) / 2.0) / ref if abs(g - (r + b) / 2.0) > 0.004 else 0.0
+    warm_cast = (r - b) / ref if abs(r - b) > 0.004 else 0.0
+    hi_frac = float(np.mean(luma > 0.90))
+    clip_frac = float(np.mean(luma >= 0.995))
+    maxc, minc = rgb.max(axis=-1), rgb.min(axis=-1)
+    subject_sat = float(np.mean((maxc - minc)[luma > p60])) if np.any(luma > p60) else 0.0
+
+    # noise: robust sigma of the fine high-pass on the background of a
+    # full-resolution central crop
+    full = np.asarray(full_rgb, dtype=np.float32)
+    fh, fw = full.shape[:2]
+    ch, cw = min(fh, 1024), min(fw, 1024)
+    y0, x0 = (fh - ch) // 2, (fw - cw) // 2
+    crop = full[y0:y0 + ch, x0:x0 + cw]
+    cl = 0.299 * crop[..., 0] + 0.587 * crop[..., 1] + 0.114 * crop[..., 2]
+    hp = cl - _gaussian_blur(cl, 2)
+    cbg = cl <= np.percentile(cl, 40)
+    vals = hp[cbg] if np.count_nonzero(cbg) > 50 else hp.ravel()
+    sigma = 1.4826 * float(np.median(np.abs(vals - np.median(vals))))
+    noise_rel = sigma / ref
+
+    # Tint that would fully neutralise the background's green cast (the
+    # inverse of apply_cosmetics' tint formula), for the report only.
+    neutral_tint = (g - (r + b) / 2.0) / 1.5 / _WB_TEMP_TINT_STEP * 100.0
+    neutral_temp = (b - r) / 2.0 / _WB_TEMP_TINT_STEP * 100.0
+    return {"bg_level": bg_level, "bg_rgb": bg_rgb, "green_cast": green_cast,
+            "warm_cast": warm_cast, "hi_frac": hi_frac, "clip_frac": clip_frac,
+            "noise_rel": noise_rel, "subject_sat": subject_sat,
+            "neutral_tint": neutral_tint, "neutral_temperature": neutral_temp}
+
+
+def _lerp01(x, lo, hi):
+    """0 at/below lo, 1 at/above hi, linear in between."""
+    return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+
+
+def magic_wand_tone(a, rgb):
+    """Camera RAW slider values for the Magic Wand, in two layers:
+    - the objective corrections compute_auto_tone makes: Temperature/Tint
+      neutralising the sky background's colour cast (light pollution, not
+      real nebula/star colour) and Blacks/Whites setting the black/white
+      points;
+    - the finishing moves from analyze_image_tone's measurements, each in a
+      narrow conservative range: Highlights -5..-15 (protect cores),
+      Shadows +5..+12 and Texture +5..+10 (less when noisy), Vibrance
+      +8..+15, Clarity/Dehaze/Saturation 0.
+    Blacks/Whites are solved AFTER Highlights/Shadows (on the image as they
+    leave it): this app's Shadows lifts everything below mid-grey, sky
+    included, so the black point has to re-anchor the sky - Shadows then
+    only opens up the faint signal above it instead of washing the
+    background out. rgb is the (subsampled) untouched source.
+    NB this app's Blacks raises the black point for POSITIVE values
+    (darker sky), the opposite of Lightroom's sign."""
+    noisy = _lerp01(a["noise_rel"], 0.08, 0.35)
+    finishing = {
+        "highlights": float(-round(5 + 10 * _lerp01(a["hi_frac"], 0.0005, 0.02))),
+        "shadows": float(round(12 - 7 * noisy)),
+        "texture": float(round(10 - 5 * noisy)),
+        "clarity": 0.0,
+        "dehaze": 0.0,
+        "vibrance": float(round(15 - 7 * _lerp01(a["subject_sat"], 0.05, 0.30))),
+        "saturation": 0.0,
+    }
+    wb = compute_auto_tone(rgb)
+    tone = {"temperature": round(wb["temperature"], 1), "tint": round(wb["tint"], 1)}
+    shaped = apply_cosmetics(rgb, {**tone, "highlights": finishing["highlights"],
+                                   "shadows": finishing["shadows"]})
+    levels = compute_auto_tone(shaped)
+    tone["blacks"] = float(round(levels["blacks"]))
+    tone["whites"] = float(round(levels["whites"]))
+    tone.update(finishing)
+    return tone
+
+
+# Share of detected stars the Magic Wand lets through its size cutoff: the
+# spike effect is for the stars that stand out, not the whole field.
+MAGIC_WAND_SPIKED_FRACTION = 0.12
+# In Simple mode a star at this multiple of the Minimum diameter gets 10%
+# of the full look (log-diameter smoothstep ramp from 0 at 1x to full at
+# SPIKE_UNIFORM_REF_MULT x, see _interp_anchor_params) - "a noticeable
+# spike" for the Magic Wand's crowding limit.
+_SIMPLE_NOTICEABLE_MULT = SPIKE_UNIFORM_REF_MULT ** 0.196
+
+
+def _magic_wand_cutoff(fwhm, target):
+    """(cutoff, note): the smallest star size that lets at most
+    MAGIC_WAND_SPIKED_FRACTION of the stars through (the renderer spikes
+    fwhm >= cutoff), raised to the focal-length target when that's more
+    selective, but never above the biggest star. Chosen among the DISTINCT
+    sizes present - detectors report sizes in coarse steps, and a cutoff
+    equal to a size shared by most of the field would let all of them in.
+    If no size is rare enough (every star the same size), nothing stands
+    out: the cutoff goes just past the biggest star, leaving Twinkle."""
+    fwhm = np.asarray(fwhm, dtype=np.float64)
+    n = len(fwhm)
+    distinct = np.unique(fwhm)
+    ok = [c for c in distinct if np.count_nonzero(fwhm >= c) <= MAGIC_WAND_SPIKED_FRACTION * n]
+    if not ok:
+        return float(distinct[-1]) + 1.0, "no star stands out in size - only Twinkle hints"
+    c = float(ok[0])
+    if target > c:
+        c = min(target, float(distinct[-1]))
+    return c, None
+
+
+def magic_wand_spikes(focal_mm, stars, current_rotation):
+    """Spike settings from the (declared or estimated) focal length and the
+    image's own stars: (globals, anchors, simple, info) - `anchors` for Per
+    size mode, `simple` for Simple mode (the App writes whichever mode is
+    active). Per size fits this best: its Small tab diameter is the cutoff (stars below it get no spike,
+    stars at it already get Small's own look) independently of where the
+    full look is reached - in Simple mode one number is both the cutoff
+    and the start of a ramp from zero to full at 4x it, so "only the
+    standout stars" and "clearly visible spikes on them" can't both hold.
+    Focal length sets the look (short -> long): cutoff target 3 -> 10px,
+    Sharpness 95 -> 55, Length 12x -> 8x, Intensity 130 -> 165, Thickness
+    0.6 -> 1.0; Medium and Large get those values, Small (the smallest
+    spiked stars) about half the length/intensity. Each value is clamped
+    to its tab's slider range (see spike_anchor_slider_range)."""
+    t = _lerp01(np.log(focal_mm), np.log(MAGIC_WAND_FOCAL_SHORT_MM), np.log(MAGIC_WAND_FOCAL_LONG_MM))
+    target = 3.0 + 7.0 * t
+    rotation = current_rotation if 0.0 <= current_rotation <= 45.0 else 30.0
+    globals_ = {"sharpness": float(round(95 - 40 * t)), "variation": 15.0,
+                "twinkle": 15.0, "rotation": float(rotation)}
+    look = {"length": round(12.0 - 4.0 * t, 1),
+            "intensity": float(5 * round((130 + 35 * t) / 5)),
+            "thickness": round(0.6 + 0.4 * t, 1),
+            "rainbow": 40.0, "saturation": 70.0,
+            "soft_flare": 15.0, "flare_reach": 40.0}
+    small_look = dict(look, length=round(look["length"] * 0.5, 1),
+                      intensity=float(5 * round(look["intensity"] * 0.5 / 5)),
+                      rainbow=20.0, soft_flare=8.0)
+
+    if stars:
+        fwhm = np.array([s[2] for s in stars], dtype=np.float64)
+        cutoff, note = _magic_wand_cutoff(fwhm, target)
+        top = float(fwhm.max())
+        n_spiked = int(np.count_nonzero(fwhm >= cutoff))
+        n_stars = len(fwhm)
+    else:
+        cutoff, note, top, n_spiked, n_stars = target, None, target * 3.0, 0, 0
+    large_d = max(top, cutoff * 2.0)
+    diams = (cutoff, (cutoff * large_d) ** 0.5, large_d)
+
+    anchors, clamped = [], set()
+    for tab, (d, lk) in enumerate(zip(diams, (small_look, look, look))):
+        vals = {"diam": d, **lk}
+        out = {}
+        for k, v in vals.items():
+            lo, hi = spike_anchor_slider_range(tab, k)
+            cv = float(np.clip(v, lo, hi))
+            if k != "diam" and abs(cv - v) > 1e-9:
+                clamped.add(f"{SPIKE_ANCHOR_TAB_LABELS[tab]} {k}")
+            # the cutoff rounds UP, so rounding never lets more stars in
+            out[k] = (math.ceil(cv * 10.0 - 1e-9) / 10.0 if (k == "diam" and tab == 0)
+                      else round(cv, 1))
+        anchors.append(out)
+    if stars:   # counted against the final (rounded) cutoff the renderer will use
+        n_spiked = int(np.count_nonzero(fwhm >= anchors[0]["diam"]))
+
+    # Simple mode: one slider set with the full look, and a Minimum
+    # diameter that is both the cutoff and where the ramp to that look
+    # starts (0 at it, half strength at 2x, full at SPIKE_UNIFORM_REF_MULT
+    # x). Between two limits on this image's own star sizes, the focal
+    # length target is used as far as they allow: not so low that more
+    # than MAGIC_WAND_SPIKED_FRACTION of the stars get a noticeable
+    # (>= 10% strength, i.e. >= ~1.31x the minimum) spike, not so high
+    # that the biggest 2% of stars miss half strength - visibility wins if
+    # the two conflict (a narrow size spread).
+    lo_d, hi_d = SPIKE_ANCHOR_DIAM_RANGES[0]
+    if stars and note is None:
+        # whole px (the slider's step): each limit rounded on its own safe
+        # side, so rounding can't undo it
+        crowd_floor = math.ceil(float(np.percentile(fwhm, 100 * (1 - MAGIC_WAND_SPIKED_FRACTION)))
+                                / _SIMPLE_NOTICEABLE_MULT - 1e-9)
+        visible_cap = max(1, math.floor(float(np.percentile(fwhm, 98)) / 2.0))
+        simple_min = min(max(round(target), crowd_floor), visible_cap)
+        simple_note = ("star sizes are too similar for Simple mode to pick only the standouts - "
+                       "Per size mode does it better" if crowd_floor > visible_cap else None)
+    else:
+        simple_min = math.ceil(cutoff)
+        simple_note = None
+    simple_min = float(np.clip(simple_min, lo_d, hi_d))
+    simple = {"min_diam": simple_min}
+    for k, v in look.items():
+        lo, hi = _SPIKE_ANCHOR_PARAM_FULL_RANGE[k]
+        simple[k] = round(float(np.clip(v, lo, hi)), 1)
+    simple_spiked = (int(np.count_nonzero(fwhm >= simple_min * _SIMPLE_NOTICEABLE_MULT))
+                     if stars else 0)
+    simple_half = int(np.count_nonzero(fwhm >= 2.0 * simple_min)) if stars else 0
+
+    info = {"target": target, "cutoff": anchors[0]["diam"], "n_spiked": n_spiked,
+            "n_stars": n_stars, "note": note, "clamped": sorted(clamped),
+            "simple_spiked": simple_spiked, "simple_half": simple_half,
+            "simple_note": simple_note}
+    return globals_, anchors, simple, info
+
+
+def compute_tone_wand(full_rgb):
+    """What the Camera RAW Magic Wand sets (see magic_wand_tone), plus a
+    human-readable report. full_rgb: the untouched source (H,W,3) float01."""
+    a = analyze_image_tone(full_rgb)
+    tone = magic_wand_tone(a, _subsample(np.asarray(full_rgb, dtype=np.float32)))
+
+    lines = ["IMAGE ANALYSIS"]
+    if a["bg_level"] > 0.20:
+        sky = f"washed out (level {a['bg_level']:.2f})"
+    elif a["bg_level"] < 0.02:
+        sky = f"very dark (level {a['bg_level']:.3f})"
+    else:
+        sky = f"level {a['bg_level']:.2f}"
+    lines.append(f"- Sky background: {sky} -> black point Blacks {tone['blacks']:+.0f}, "
+                 f"white point Whites {tone['whites']:+.0f} (set after Shadows, so the sky stays dark)")
+    casts = []
+    if a["green_cast"] > 0.03:
+        casts.append(f"green ({a['green_cast'] * 100:.0f}% of the sky level)")
+    if abs(a["warm_cast"]) > 0.10:
+        casts.append(f"{'orange' if a['warm_cast'] > 0 else 'blue'} ({abs(a['warm_cast']) * 100:.0f}%)")
+    lines.append("- Colour cast: " + (", ".join(casts) if casts else "none to speak of")
+                 + f" -> neutralised on the sky: Temperature {tone['temperature']:+.1f}, "
+                   f"Tint {tone['tint']:+.1f}")
+    lines.append(f"- Bright cores: {a['hi_frac'] * 100:.2f}% of pixels above 90% "
+                 f"-> Highlights {tone['highlights']:+.0f}, Whites {tone['whites']:+.0f}")
+    lines.append(f"- Background noise: {a['noise_rel'] * 100:.0f}% of the sky level "
+                 f"-> Shadows {tone['shadows']:+.0f}, Texture {tone['texture']:+.0f}")
+    lines.append(f"- Colour: mean subject saturation {a['subject_sat']:.2f} -> Vibrance {tone['vibrance']:+.0f}")
+    return {"tone": tone, "analysis": a, "report": "\n".join(lines)}
+
+
+def compute_spike_wand(stars, focal_mm, image_shape, current_rotation=30.0, mode="uniform"):
+    """What the spike Magic Wand sets (see estimate_field_type and
+    magic_wand_spikes), plus a human-readable report. stars: the detected
+    (x, y, fwhm, ...) list in display px; focal_mm: FITS FOCALLEN or None;
+    image_shape: (h, w, ...) of the image; mode: the spike mode the
+    result will be written to ("uniform" = Simple, or "per_size"), which
+    only changes what the report describes."""
+    ftype, f_mm, source, reasons = estimate_field_type(focal_mm, stars, image_shape)
+    spike_globals, anchors, simple, info = magic_wand_spikes(f_mm, stars, current_rotation)
+
+    lines = ["FOCAL LENGTH"]
+    head = (f"{f_mm:.0f}mm (declared)" if source == "declared"
+            else f"estimated: {_FIELD_TYPE_LABEL[ftype]}, ~{f_mm:.0f}mm")
+    lines.append(f"- {head}")
+    for reason in reasons:
+        lines.append(f"  {reason}")
+    lines.append("")
+    sm, md, lg = anchors
+    if mode == "per_size":
+        lines.append("SPIKES (Per size mode)")
+        if info["note"]:
+            lines.append(f"- {info['note']}")
+        lines.append(f"- Minimum star diameter (Small tab) {sm['diam']:.1f}px: {info['n_spiked']} of "
+                     f"{info['n_stars']} stars get a spike (focal length suggests {info['target']:.0f}px; "
+                     f"at most {MAGIC_WAND_SPIKED_FRACTION * 100:.0f}% of the stars)")
+        lines.append(f"- Medium {md['diam']:.1f}px / Large {lg['diam']:.1f}px: Length {lg['length']:.1f}x, "
+                     f"Intensity {lg['intensity']:.0f}, Thickness {lg['thickness']:.1f} "
+                     f"(Small: half length/intensity)")
+        look = lg
+    else:
+        lines.append("SPIKES (Simple mode)")
+        for note in (info["note"], info["simple_note"]):
+            if note:
+                lines.append(f"- {note}")
+        lines.append(f"- Minimum star diameter {simple['min_diam']:.0f}px: {info['simple_spiked']} of "
+                     f"{info['n_stars']} stars get a noticeable spike, {info['simple_half']} at half strength or "
+                     f"more (focal length suggests {info['target']:.0f}px; full effect from "
+                     f"{simple['min_diam'] * SPIKE_UNIFORM_REF_MULT:.0f}px)")
+        lines.append(f"- Length {simple['length']:.1f}x, Intensity {simple['intensity']:.0f}, "
+                     f"Thickness {simple['thickness']:.1f}")
+        look = simple
+    lines.append(f"- Rainbow {look['rainbow']:.0f}, Color saturation {look['saturation']:.0f}, "
+                 f"Soft flare {look['soft_flare']:.0f}, Flare reach {look['flare_reach']:.0f}%")
+    lines.append(f"- Sharpness {spike_globals['sharpness']:.0f}, Variation {spike_globals['variation']:.0f}, "
+                 f"Twinkle {spike_globals['twinkle']:.0f}, Rotation {spike_globals['rotation']:.0f}")
+    if info["clamped"] and mode == "per_size":
+        lines.append("- Limited by the tab's slider range: " + ", ".join(info["clamped"]))
+    return {"spike_globals": spike_globals, "spike_anchors": anchors, "spike_simple": simple,
+            "spike_info": info, "mode": mode,
+            "field_type": ftype, "focal_mm": f_mm, "focal_source": source,
+            "report": "\n".join(lines)}
 
 
 def apply_cosmetics(rgb, p):
@@ -2599,11 +2984,12 @@ class App:
                      sorted(self._spike_star_overrides.items(), key=repr)))
 
     def _has_unsaved_changes(self):
-        """Standalone mode only (in Siril the image lives in Siril, which
-        handles its own saving): an image is open and its current edits
-        differ from what was last saved to disk (or from the untouched
-        file, if nothing was saved yet)."""
-        return (self.worker.standalone and self.loaded and self._saved_sig is not None
+        """An image is open and its current edits differ from the last ones
+        that actually left this window - saved to disk (standalone) or
+        applied to the image in Siril with Process (Siril mode; closing
+        before that loses them) - or from the untouched image, if nothing
+        was saved/applied yet."""
+        return (self.loaded and self._saved_sig is not None
                 and self._edit_signature() != self._saved_sig)
 
     def _confirm_discard(self, action):
@@ -2611,10 +2997,16 @@ class App:
         asking first when there are unsaved changes."""
         if not self._has_unsaved_changes():
             return True
+        if self.worker.standalone:
+            what, without = "haven't been saved", "without saving"
+        else:
+            what = ('haven\'t been applied to the image in Siril yet '
+                    '("Process and import in Siril")')
+            without = "without applying them"
         return messagebox.askyesno(
             "Unsaved changes",
-            f'"{self.active_filename.get()}" has changes that haven\'t been saved.\n\n'
-            f"{action} without saving?",
+            f'"{self.active_filename.get()}" has changes that {what}.\n\n'
+            f"{action} {without}?",
             icon="warning", default="no")
 
     def _on_close(self):
@@ -2772,8 +3164,8 @@ class App:
 
         ttk.Button(frm_ctrl, text="✨ Magic Wand", style="Accent.TButton",
                    command=self._on_magic_wand).pack(fill="x", pady=(14, 0))
-        ttk.Label(frm_ctrl, text="Auto-balances color/tone and sizes the default spikes "
-                                  "to this image's own focal length",
+        ttk.Label(frm_ctrl, text="Auto-balances color and tone (Camera RAW sliders only - "
+                                  "the spikes have their own Magic Wand)",
                   style="Muted.TLabel", wraplength=210, justify="left").pack(
             fill="x", pady=(2, 0))
 
@@ -3000,12 +3392,20 @@ class App:
         self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
         self._spike_help_label.grid(
             row=19, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+        ttk.Button(frm_spikes, text="✨ Magic Wand", style="Accent.TButton",
+                   command=self._on_spike_magic_wand).grid(
+            row=20, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 0))
+        ttk.Label(frm_spikes, text="Spikes only: picks the standout stars and sizes their "
+                                   "spikes to this image's focal length (also run when an "
+                                   "image is opened)",
+                  style="CardMuted.TLabel", wraplength=300, justify="left").grid(
+            row=21, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 8))
         ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
                    command=self._reset_spike_edits).grid(
-            row=20, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+            row=22, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
         ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
                    command=self._reset_spike_defaults).grid(
-            row=21, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+            row=23, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
         self._update_spike_mode_ui()
 
         # ---- Status bar ----
@@ -3597,44 +3997,61 @@ class App:
         self._on_tone_slider()
 
     def _on_magic_wand(self):
-        """One button, two conservative "make it look right" corrections
-        that don't require choosing per-color/per-channel values by hand
-        (see compute_auto_tone/compute_focal_calibration's own docstrings
-        for what each does and doesn't touch):
-          - Base's Temperature/Tint/Blacks/Whites, from an auto white
-            balance + auto levels pass over the actual pixels.
-          - Spike Length/Thickness/Intensity and the Minimum diameter
-            cutoff, from this image's own focal length - the same
-            calibration _reload_thread applies once automatically at load,
-            re-run on demand (e.g. after fiddling with sliders and wanting
-            a sane baseline back, without a full Reload)."""
-        if not self.loaded or self._src_preview_rgb is None:
+        """Camera RAW Magic Wand (left panel): analyses the untouched
+        source image and sets ONLY the tone sliders (see compute_tone_wand),
+        then shows what it found and why. The spikes have their own Magic
+        Wand (_on_spike_magic_wand)."""
+        if not self.loaded or self._pristine_full is None:
             return
-        auto = compute_auto_tone(self._src_preview_rgb)
-        for key, value in auto.items():
+        tw = compute_tone_wand(self._pristine_full)
+        for key, value in tw["tone"].items():
             self.tone[key].set(value)
+        self._update_all_labels()
+        self._on_tone_slider()
+        self.worker.log("frankSpikes Magic Wand (Camera RAW):\n" + tw["report"])
+        messagebox.showinfo("Magic Wand - Camera RAW", tw["report"])
 
+    def _apply_spike_wand(self):
+        """Sets ONLY the spike sliders from this image's focal length and
+        detected stars (see compute_spike_wand) and returns the report -
+        in whichever mode is active (Simple's single slider set, or the
+        Per size tabs), never switching it. Leaves the ray count, the
+        flare rays/ring/symmetry settings and per-star edits as they are.
+        Run on the button and automatically once an image has loaded."""
         try:
             focal_length = self.worker.get_focal_length()
         except Exception as e:
             self.worker.log(f"frankSpikes: couldn't read focal length: {e}")
             focal_length = None
-        calib = compute_focal_calibration(focal_length)
-        if calib["length_scale"] is not None:
-            self._apply_length_calibration(calib["length_scale"])
-        if calib["thickness_scale"] is not None:
-            self._apply_thickness_calibration(calib["thickness_scale"])
-        if calib["intensity_scale"] is not None:
-            self._apply_intensity_calibration(calib["intensity_scale"])
-        if calib["diam_scale"] is not None and self._stars:
-            fwhm_arr = np.array([s[2] for s in self._stars], dtype=np.float64)
-            p5, p50, p90 = np.percentile(fwhm_arr, [5, 50, 90])
-            ds = calib["diam_scale"]
-            self._apply_size_calibration({"small": float(p5) * ds, "medium": float(p50) * ds,
-                                            "large": float(p90) * ds})
+        shape = self._pristine_full.shape if self._pristine_full is not None else self.full_shape
+        mode = self.spike_mode.get()
+        sw = compute_spike_wand(self._stars, focal_length, shape,
+                                current_rotation=self.spike_rotation.get(), mode=mode)
+        if mode == "per_size":
+            for av, values in zip(self.spike_anchors, sw["spike_anchors"]):
+                for key, value in values.items():
+                    av[key].set(value)
+        else:
+            self.spike_uniform_min_diam.set(sw["spike_simple"]["min_diam"])
+            for key, value in sw["spike_simple"].items():
+                if key != "min_diam":
+                    self.spike_uniform[key].set(value)
+        g = sw["spike_globals"]
+        self.spike_sharpness.set(g["sharpness"])
+        self.spike_variation.set(g["variation"])
+        self.spike_twinkle.set(g["twinkle"])
+        self.spike_rotation.set(g["rotation"])
+        self._update_all_labels()
+        self._on_spike_slider()
+        self.worker.log("frankSpikes Magic Wand (spikes):\n" + sw["report"])
+        return sw["report"]
 
-        self._on_tone_slider()
-        self._schedule_spike_preview()
+    def _on_spike_magic_wand(self):
+        """Spike Magic Wand button (spike panel)."""
+        if not self.loaded:
+            return
+        report = self._apply_spike_wand()
+        messagebox.showinfo("Magic Wand - Spikes", report)
 
     def _reset_spike_defaults(self):
         """Resets the spike sliders to SPIKE_DEFAULTS - leaves per-star
@@ -4603,6 +5020,12 @@ class App:
                         self._apply_thickness_calibration(thickness_scale)
                     if intensity_scale is not None:
                         self._apply_intensity_calibration(intensity_scale)
+                    # Spike sliders from the spike Magic Wand (on top of
+                    # the calibration above) - never allowed to break a load.
+                    try:
+                        self._apply_spike_wand()
+                    except Exception as e:
+                        self.worker.log(f"frankSpikes: spike Magic Wand failed: {format_error(e)}")
                     # the freshly opened file, with the automatic
                     # calibration above, counts as "nothing to save"
                     self._saved_sig = self._edit_signature()
@@ -4634,6 +5057,9 @@ class App:
                     self._busy_end()
                     self._siril_busy = False
                     self.btn_process.config(state="normal")
+                    # now in Siril: the edits that result was rendered with
+                    # are no longer at risk when the window closes
+                    self._saved_sig = self._processed_sig
                     # Stays open on purpose: each Process call pushes an
                     # independent undo checkpoint in Siril (see push_rgb),
                     # so if the result isn't liked, the user can keep

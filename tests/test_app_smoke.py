@@ -1,5 +1,6 @@
 import time
 import unittest
+from unittest import mock
 import tkinter as tk
 import numpy as np
 from _harness import fs
@@ -290,9 +291,9 @@ class TestTonePreviewZoomGating(AppCase):
 
 
 class TestMagicWand(AppCase):
-    """The Magic Wand button: auto white balance/levels (Base) plus
-    focal-length spike calibration, in one click - see App._on_magic_wand,
-    compute_auto_tone and compute_focal_calibration."""
+    """Two Magic Wands, one job each: the Camera RAW one only sets the tone
+    sliders, the spike one only the spike sliders (and runs by itself
+    when an image loads) - see App._on_magic_wand/_apply_spike_wand."""
 
     def _prime_loaded_state(self, focal_length=500.0):
         a = self.app
@@ -300,6 +301,7 @@ class TestMagicWand(AppCase):
         rng = np.random.default_rng(0)
         img = np.clip(0.05 + rng.normal(0, 0.01, (60, 60, 3)), 0, 1).astype(np.float32)
         img[::5, ::5] = 0.9  # sprinkle in enough "stars" to be a believable field
+        a._pristine_full = img
         a._src_preview_rgb = img
         a._stars = [(float(x), float(y), 6.0 + (x % 5), 1.0, (1.0, 1.0, 1.0))
                     for x in range(0, 60, 5) for y in range(0, 60, 5)]
@@ -308,35 +310,109 @@ class TestMagicWand(AppCase):
         a._schedule_spike_preview = lambda: None
         return a
 
+    def _spike_state(self):
+        a = self.app
+        return (a.spike_mode.get(), a.spike_sharpness.get(), a.spike_twinkle.get(),
+                [{k: av[k].get() for k in fs._ANCHOR_PARAM_KEYS + ("diam",)} for av in a.spike_anchors],
+                {k: a.spike_uniform[k].get() for k in fs._ANCHOR_PARAM_KEYS})
+
+    def _tone_state(self):
+        return {k: v.get() for k, v in self.app.tone.items() if not k.endswith("_label")}
+
+    def _press(self, method):
+        with mock.patch.object(fs.messagebox, "showinfo") as info:
+            method()
+        return info
+
     def test_does_nothing_before_an_image_is_loaded(self):
         a = self.app
         a.loaded = False
-        before = a.tone["temperature"].get()
-        a._on_magic_wand()
-        self.assertEqual(a.tone["temperature"].get(), before)
+        before = (self._tone_state(), self._spike_state())
+        i1 = self._press(a._on_magic_wand)
+        i2 = self._press(a._on_spike_magic_wand)
+        self.assertEqual((self._tone_state(), self._spike_state()), before)
+        i1.assert_not_called()
+        i2.assert_not_called()
 
-    def test_sets_base_tone_from_the_image(self):
+    def test_tone_wand_sets_only_the_camera_raw_sliders(self):
         a = self._prime_loaded_state()
-        a.tone["temperature"].set(0.0)
-        a.tone["blacks"].set(0.0)
-        a._on_magic_wand()
-        expected = fs.compute_auto_tone(a._src_preview_rgb)
-        for key, value in expected.items():
+        a.tone["exposure"].set(7.0)
+        spikes_before = self._spike_state()
+        info = self._press(a._on_magic_wand)
+        tw = fs.compute_tone_wand(a._pristine_full)
+        for key, value in tw["tone"].items():
             self.assertAlmostEqual(a.tone[key].get(), value, places=3)
+        self.assertEqual(a.tone["exposure"].get(), 7.0)
+        self.assertEqual(self._spike_state(), spikes_before)
+        info.assert_called_once()
+        self.assertNotIn("FOCAL LENGTH", info.call_args[0][1])
 
-    def test_applies_focal_length_spike_calibration(self):
-        a = self._prime_loaded_state(focal_length=300.0)
-        a._on_magic_wand()
-        calib = fs.compute_focal_calibration(300.0)
-        self.assertAlmostEqual(a.spike_uniform["length"].get(),
-                                fs.SPIKE_UNIFORM_DEFAULTS["length"] * calib["length_scale"],
-                                places=3)
+    def test_spike_wand_in_simple_mode_writes_simple_and_stays_simple(self):
+        a = self._prime_loaded_state()
+        a.spike_mode.set("uniform")
+        a._on_spike_mode_change()
+        tone_before = self._tone_state()
+        tabs_before = [{k: av[k].get() for k in fs._ANCHOR_PARAM_KEYS} for av in a.spike_anchors]
+        info = self._press(a._on_spike_magic_wand)
+        sw = fs.compute_spike_wand(a._stars, 500.0, a._pristine_full.shape,
+                                   current_rotation=a.spike_rotation.get(), mode="uniform")
+        self.assertEqual(a.spike_mode.get(), "uniform")
+        self.assertEqual(a.spike_uniform_min_diam.get(), sw["spike_simple"]["min_diam"])
+        for key, value in sw["spike_simple"].items():
+            if key != "min_diam":
+                self.assertAlmostEqual(a.spike_uniform[key].get(), value, places=3)
+        self.assertEqual([{k: av[k].get() for k in fs._ANCHOR_PARAM_KEYS} for av in a.spike_anchors],
+                         tabs_before)
+        self.assertEqual(self._tone_state(), tone_before)
+        self.assertIn("SPIKES (Simple mode)", info.call_args[0][1])
 
-    def test_no_focal_length_leaves_spike_defaults_alone(self):
+    def test_spike_wand_in_per_size_mode_writes_the_tabs(self):
+        a = self._prime_loaded_state()
+        a.spike_mode.set("per_size")
+        a._on_spike_mode_change()
+        rays_before = a.spike_rays.get()
+        info = self._press(a._on_spike_magic_wand)
+        sw = fs.compute_spike_wand(a._stars, 500.0, a._pristine_full.shape,
+                                   current_rotation=a.spike_rotation.get(), mode="per_size")
+        self.assertEqual(a.spike_mode.get(), "per_size")
+        for av, values in zip(a.spike_anchors, sw["spike_anchors"]):
+            for key, value in values.items():
+                self.assertAlmostEqual(av[key].get(), value, places=3)
+        self.assertEqual(a.spike_sharpness.get(), sw["spike_globals"]["sharpness"])
+        self.assertEqual(a.spike_rays.get(), rays_before)
+        self.assertIn("SPIKES (Per size mode)", info.call_args[0][1])
+
+    def test_pressing_twice_gives_the_same_sliders(self):
         a = self._prime_loaded_state(focal_length=None)
-        before = a.spike_uniform["length"].get()
-        a._on_magic_wand()
-        self.assertEqual(a.spike_uniform["length"].get(), before)
+        self._press(a._on_magic_wand)
+        self._press(a._on_spike_magic_wand)
+        first = (self._tone_state(), self._spike_state())
+        self._press(a._on_magic_wand)
+        self._press(a._on_spike_magic_wand)
+        self.assertEqual((self._tone_state(), self._spike_state()), first)
+
+    def test_loading_an_image_runs_the_spike_wand_in_simple_mode_not_the_tone_wand(self):
+        a = self.app
+        a.worker.get_focal_length = lambda: 400.0
+        a._render_preview = lambda: None
+        a._schedule_spike_preview = lambda: None
+        a._schedule_hires_fetch = lambda: None
+        a.spike_mode.set("uniform")
+        a._on_spike_mode_change()
+        tone_before = self._tone_state()
+        img = np.clip(0.05 + np.random.default_rng(1).normal(0, 0.01, (60, 60, 3)), 0, 1).astype(np.float32)
+        stars = [(float(x), float(y), 3.0 + (x % 7), 1.0, (1.0, 1.0, 1.0))
+                 for x in range(0, 60, 4) for y in range(0, 60, 4)]
+        a.queue.put(("loaded", ("img.fits", img, img, (60, 60), stars, None, None, None, None)))
+        with mock.patch.object(fs.messagebox, "showinfo") as info:
+            a._poll_queue()
+        info.assert_not_called()          # no pop-up on open, only on the button
+        sw = fs.compute_spike_wand(stars, 400.0, img.shape, current_rotation=a.spike_rotation.get())
+        self.assertEqual(a.spike_mode.get(), "uniform")      # stays in Simple
+        self.assertEqual(a.spike_uniform_min_diam.get(), sw["spike_simple"]["min_diam"])
+        self.assertEqual(self._tone_state(), tone_before)
+        # and the freshly opened image doesn't count as having unsaved edits
+        self.assertEqual(a._saved_sig, a._edit_signature())
 
 
 if __name__ == "__main__":
