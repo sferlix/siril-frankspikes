@@ -1,5 +1,6 @@
-"""Standalone mode: closing the window (or opening another image) with
-edits that haven't been saved asks for confirmation first."""
+"""Closing the window (or, standalone, opening another image) with edits
+that haven't been saved - or, in Siril mode, applied to the image with
+Process - asks for confirmation first."""
 import unittest
 import tkinter as tk
 from unittest import mock
@@ -117,14 +118,39 @@ class TestUnsavedChanges(UnsavedCase):
         pick.assert_not_called()
 
 
-class TestSirilModeNeverAsks(UnsavedCase):
+class TestSirilMode(UnsavedCase):
+    """In Siril mode the edits only reach the image with "Process and
+    import in Siril" - closing before that loses them, so it asks too."""
     worker_cls = _SirilStub
 
-    def test_edits_in_siril_mode_close_directly(self):
-        self.app.spike_rotation.set(self.app.spike_rotation.get() + 10)
+    def test_no_edits_closes_without_asking(self):
         ask = self._close(False)
         ask.assert_not_called()
         self.assertTrue(self.destroyed)
+
+    def test_edits_not_yet_applied_ask_first(self):
+        self.app.spike_rotation.set(self.app.spike_rotation.get() + 10)
+        ask = self._close(False)
+        ask.assert_called_once()
+        self.assertIn("Siril", ask.call_args[0][1])
+        self.assertFalse(self.destroyed)
+
+    def test_applied_with_process_closes_without_asking(self):
+        self.app.tone["exposure"].set(20.0)
+        self.app._processed_sig = self.app._edit_signature()     # Process clicked
+        self.app.queue.put(("done", None))                        # ... and finished
+        self.app._poll_queue()
+        ask = self._close(False)
+        ask.assert_not_called()
+        self.assertTrue(self.destroyed)
+
+    def test_a_failed_process_is_still_unapplied(self):
+        self.app.tone["exposure"].set(20.0)
+        self.app._processed_sig = self.app._edit_signature()
+        self.app.queue.put(("error", "boom"))
+        with mock.patch.object(fs.messagebox, "showerror"):
+            self.app._poll_queue()
+        self.assertTrue(self.app._has_unsaved_changes())
 
 
 if __name__ == "__main__":
