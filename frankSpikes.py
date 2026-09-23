@@ -1483,12 +1483,24 @@ def _measure_bright_star_profile(luma, x, y, peak, r=25):
     outer = patch[rad > r * 0.7]
     bg = float(np.median(outer)) if outer.size else float(np.median(patch))
     half = bg + max(peak - bg, 1e-6) / 2.0
+    # Half-max radius interpolated between whole-pixel ring centres (the
+    # peak itself at radius 0) - taking the first ring below half as-is
+    # (its outer edge, a whole number) used to report even-integer sizes,
+    # about twice too big for small stars (a 3.2px star read as 6px).
     half_r = float(r)
+    prev_r, prev_v = 0.0, float(peak)
     for radius in range(1, r):
         ring = patch[(rad >= radius - 1) & (rad < radius)]
-        if ring.size and float(ring.mean()) < half:
-            half_r = float(radius)
+        if not ring.size:
+            continue
+        cur_r = float(np.mean(rad[(rad >= radius - 1) & (rad < radius)]))
+        cur_v = float(ring.mean())
+        if cur_v < half:
+            span = prev_v - cur_v
+            frac = (prev_v - half) / span if span > 1e-9 else 0.5
+            half_r = prev_r + float(np.clip(frac, 0.0, 1.0)) * (cur_r - prev_r)
             break
+        prev_r, prev_v = cur_r, cur_v
     fwhm = max(1.5, half_r * 2.0)
     amplitude = max(1e-6, peak - bg)
     return fwhm, amplitude
