@@ -6,22 +6,33 @@ Light/tone and color/hue adjustment tool for a single image, in the same
 dark-themed style and with the same real full-resolution zoom/pan preview
 as BB/NB Mixer.
 
-Controls:
-Light & Tones
-   - Exposure: brightens/darkens the whole image
-   - Contrast: separates the subject from the background
-   - Blacks / Sky Background: sets how deep the sky/background is
-   - Highlights / Whites: protects the brightest areas from burning, or
-     pushes them brighter
-   - Clarity: local (mid-tone) contrast on a large-radius unsharp mask,
-     brings out nebula structure without touching global contrast
-Color & Hue
-   - Vibrance: boosts weaker colors more than already-saturated ones
-     (protects reds like Ha from clipping), unlike a flat Saturation boost
-   - Saturation: makes all colors more or less vivid, uniformly
+Controls (left panel, "camera raw"-style, collapsible Base/Detail sections -
+see TONE_PARAM_DEFS/apply_cosmetics):
+Base
    - Temperature: blue/yellow color balance
    - Tint: green/magenta color balance (handy for removing the greenish
      light-pollution cast)
+   - Exposure: brightens/darkens the whole image
+   - Contrast: separates the subject from the background
+   - Highlights: recovers or pushes just the brightest tonal region
+     (e.g. a blown-out core), leaving midtones alone - a luminance-weighted
+     mask, not a flat stretch (see Whites below for that)
+   - Shadows: brightens or deepens just the darkest tonal region (e.g. the
+     sky background), same masked approach as Highlights
+   - Whites: sets the absolute white point - a flat stretch of the whole
+     range, unlike Highlights above
+   - Blacks: sets the absolute black point - a flat stretch of the whole
+     range, unlike Shadows above
+Detail
+   - Texture: fine (small-radius) local contrast - grain/small-scale detail
+   - Clarity: local (mid-tone) contrast on a large-radius unsharp mask,
+     brings out nebula structure without touching global contrast
+   - Dehaze: a much larger-radius local-contrast + saturation push, a
+     simplified stand-in for removing (or, negative, adding) a soft haze/
+     veil - real depth-aware dehazing needs more than a single image
+   - Vibrance: boosts weaker colors more than already-saturated ones
+     (protects reds like Ha from clipping), unlike a flat Saturation boost
+   - Saturation: makes all colors more or less vivid, uniformly
 Diffraction Spikes (panel to the right of the preview)
    - Realistic star spikes as produced by a reflector's secondary-mirror
      spider: 4 rays for a 2-vane (or refractor) spider, 6 rays for a 3-vane
@@ -44,8 +55,10 @@ Diffraction Spikes (panel to the right of the preview)
        Small tab's own star size get no spike at all (that tab doubles as
        the old "minimum diameter" cutoff).
    - Natural variation: a small, deterministic per-star jitter on each
-     spike's length and rotation (seeded by the star's own position, so it
-     never changes between re-renders) - breaks up the "stamped/CGI" look
+     spike's length (seeded by the star's own position, so it never changes
+     between re-renders) - breaks up the "stamped/CGI" look. Rotation is
+     NOT jittered - a real spike's angle comes from the telescope's own
+     spider vanes, identical for every star in the frame
      of many similar-size stars all rendering pixel-identical spikes.
      0 = perfectly formulaic, matching every star's raw parameters exactly.
    - Twinkle: a tiny, fixed hint of spike on every star below the Minimum
@@ -62,16 +75,42 @@ Diffraction Spikes (panel to the right of the preview)
      where seeing/optics blur real diffraction spikes well beyond a
      pixel-crisp render (100 = untouched, lower = softer).
    - Color hue: rotates every star's spike colour by the same amount.
-   - Color fringing (per anchor): a blue-near-star/warm-near-tip chromatic
-     separation on top of the star's colour, like real wavelength-dependent
-     diffraction.
-   - Rainbow intensity (per anchor): an artistic multi-hue cycle along each
-     ray, also layered on top of the star's own colour.
-   - Color saturation (per anchor): 0 keeps that size of star's spike/flare
+   - Diffraction rainbow (per anchor): the physical colour pattern of a
+     real spike - it starts in the star's own colour, then (further out)
+     breaks into short coloured segments with dimmer gaps (a spider vane's
+     wavelength-dependent diffraction nulls), washing back to neutral
+     after a few segments. 0 = the star's own colour all the way out.
+   - Rainbow segment spacing (global, px): the distance between those
+     segments - set by the optics, so the same for every star (bigger
+     stars, with longer spikes, simply show more of them).
+   - Spikes keep their width along their whole length and fade with a
+     long power-law tail (plus a slight, irregular brightness flicker),
+     as in real photos, rather than tapering to a needle point.
+   - Color saturation (per anchor): 0 keeps that size of star's spike rays
      pure white regardless of its own colour or the other color sliders.
-   - Soft flare tail length (per anchor): adds a long power-law tail to the
-     Soft flare glow, out to that many star diameters (0 = the original
-     gaussian-only glow, unchanged).
+   - Flare reach (per anchor, % of the spike length): how far the Soft
+     flare and its rays extend. They start right at the star's visible
+     edge (so even a short reach shows outside the core) and never reach
+     past the spike tips; unlike the strengths, this keeps its value
+     across Simple mode's size ramp.
+   - Flare color saturation (per anchor): a separate 0-100 control for the
+     Soft flare and Ring flare glow's own colour, independent of
+     the spike rays' Color saturation above - 0 (the default) keeps the
+     original pure white glow, 100 tints it fully toward the star's own
+     colour.
+   - Ring flare diameter (per anchor, x star diameter): the ring's own
+     diameter relative to the star's, so it hugs the star - 1.6x (the
+     default) sits just past its edge. Always kept outside the core and
+     inside the spikes, second Airy ring included.
+   - Flare rays (per anchor): breaks the Soft flare glow up into the
+     soft, irregular streaks of a real sunburst - the same halo light
+     redistributed into rays (more of them further out, as they branch),
+     with the strongest ones hugging each main spike as faint secondary
+     spikes. 0 = a plain round glow.
+   - Flare ray symmetry (global): how strictly that ray pattern repeats in
+     every wedge between main spikes - 100 = exactly (the spider geometry
+     repeats around the aperture), 0 = fully irregular (scatter/seeing
+     don't repeat); real photos sit in between.
    - After generating, Ctrl+Click a star in the preview to remove/restore
      its spikes (this also lets you force a spike onto a star smaller than
      the Small anchor's diameter), or Ctrl+Click empty space to add one
@@ -111,15 +150,29 @@ import queue
 import traceback
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
-import sirilpy as s
-from sirilpy import SirilConnectionError
+# sirilpy is Siril's own bundled package, not something a plain "pip
+# install" can ever provide (it isn't on PyPI) - a standalone install
+# (see packaging/standalone/) never has it, and shouldn't need to: this
+# makes the import optional, and gives main() the exact same
+# SirilConnectionError a running-but-unreachable Siril would raise, so
+# "sirilpy isn't installed" and "Siril isn't running" fall back to
+# FileWorker (standalone mode) the exact same way instead of crashing
+# before main() ever runs.
+try:
+    import sirilpy as s
+    from sirilpy import SirilConnectionError
+except ImportError:
+    s = None
 
-APP_VERSION = "2.2.0"
+    class SirilConnectionError(Exception):
+        pass
+
+APP_VERSION = "2.3.0"
 PREVIEW_MAX_W = 1600
 NAV_MAX_W = 210
 NAV_MAX_H = 160
@@ -137,11 +190,18 @@ SPIKE_ANCHOR_PARAM_DEFS = [
     ("length",     "Spike length (x star diameter)",     0.5, 12,  0.1, "{:.1f}x"),
     ("intensity",  "Intensity",                          0,   250, 5,   "{:.0f}"),
     ("thickness",  "Thickness",                          0.1, 6,   0.1, "{:.1f}"),
+    # ---- Soft flare (grouped together) ----
     ("soft_flare", "Soft flare",                          0,   100, 5,   "{:.0f}"),
-    ("flare_tail", "Soft flare tail length (x star diameter)", 0, 30,  0.5, "{:.1f}x"),
+    ("flare_reach", "Flare reach (% of spike length)",    10,  100, 5,   "{:.0f}%"),
+    ("flare_rays", "Flare rays (sunburst structure)",     0,   100, 5,   "{:.0f}"),
+    # ---- Ring flare (grouped together) ----
     ("ring_flare", "Ring flare",                          0,   100, 5,   "{:.0f}"),
-    ("chroma",     "Color fringing (chromatic)",          0,   100, 5,   "{:.0f}"),
-    ("rainbow",    "Rainbow intensity",                   0,   100, 5,   "{:.0f}"),
+    ("ring_diam",  "Ring flare diameter (x star diameter)", 1.0, 6, 0.1, "{:.1f}x"),
+    # Shared by both flares above (see _spike_color_mult's use in the
+    # soft/ring flare block of render_spike_layer) - kept right after
+    # them rather than off on its own.
+    ("flare_saturation", "Flare color saturation",        0,   100, 5,   "{:.0f}"),
+    ("rainbow",    "Diffraction rainbow",                 0,   100, 5,   "{:.0f}"),
     ("saturation", "Color saturation",                    0,   100, 5,   "{:.0f}"),
 ]
 SPIKE_ANCHOR_TAB_LABELS = ("Small stars", "Medium stars", "Large stars")
@@ -171,6 +231,22 @@ SPIKE_ANCHOR_DIAM_RANGES = ((1, 15), (2, 30), (5, 60))
 # tighter one so the same slider travel maps to a finer value increment.
 SPIKE_ANCHOR_LOOK_SCALE = (0.4, 0.7, 1.0)
 _SPIKE_ANCHOR_PARAM_FULL_RANGE = {k: (lo, hi) for k, _label, lo, hi, _step, _fmt in SPIKE_ANCHOR_PARAM_DEFS}
+_SPIKE_PARAM_DEFS_BY_KEY = {k: (label, lo, hi, step, fmt)
+                            for k, label, lo, hi, step, fmt in SPIKE_ANCHOR_PARAM_DEFS}
+# Which collapsible section (see App._make_collapsible/_build_grouped_anchor_
+# sliders) each per-anchor slider belongs in - "diam" isn't in here, it's
+# shown above both sections rather than inside either (it's a "which star
+# size is this tab" selector, not really a Rays or Flare look parameter).
+SPIKE_PARAM_GROUPS = ("rays", "flare")
+SPIKE_PARAM_GROUP_TITLES = {"rays": "Rays", "flare": "Flares"}
+_SPIKE_PARAM_GROUP = {
+    "length": "rays", "intensity": "rays", "thickness": "rays",
+    "rainbow": "rays", "saturation": "rays",
+    "soft_flare": "flare", "flare_reach": "flare",
+    "ring_flare": "flare", "ring_diam": "flare",
+    "flare_saturation": "flare",
+    "flare_rays": "flare",
+}
 
 
 def spike_anchor_slider_range(tab_index, key):
@@ -182,6 +258,8 @@ def spike_anchor_slider_range(tab_index, key):
     if key == "diam":
         return SPIKE_ANCHOR_DIAM_RANGES[tab_index]
     lo, hi = _SPIKE_ANCHOR_PARAM_FULL_RANGE[key]
+    if key in _SPIKE_GEOMETRY_KEYS:
+        return lo, hi
     return lo, lo + (hi - lo) * SPIKE_ANCHOR_LOOK_SCALE[tab_index]
 
 # Single source of truth for the spike panel's defaults, used both to set
@@ -197,6 +275,84 @@ def spike_anchor_slider_range(tab_index, key):
 # (confirmed via frankSpikes' own diagnostic Reload log on a real image:
 # fwhm min=2.0px median=6.8px, only 16/1000 stars above 20px). Repositioned
 # to 3/8/18px to actually span a typical field's stars.
+
+# A real diffraction spike's absolute (angular/pixel) size is set by the
+# aperture and wavelength, essentially independent of focal length - but
+# "Spike length" here is expressed "in star diameters" (the PSF's own
+# size), and a shorter focal length spreads that same star over fewer
+# pixels (a smaller plate scale), so the same physical spike spans MORE
+# star-diameters at short focal length than at long. Two calibration
+# points, log-log interpolated (and extrapolated a bit beyond them,
+# clamped so it never goes absurd): a short (~300mm, e.g. a small
+# refractor) focal length reads roughly 8x, a medium one (~800mm, e.g. a
+# small SCT/Newtonian) roughly 3x - both from real reference photos, not a
+# closed-form optical derivation (this whole tool is stylized/artistic,
+# not physically exact).
+_FOCAL_LENGTH_REF1_MM, _FOCAL_LENGTH_REF1_LEN = 300.0, 8.0
+_FOCAL_LENGTH_REF2_MM, _FOCAL_LENGTH_REF2_LEN = 800.0, 3.0
+_FOCAL_LENGTH_LEN_MIN, _FOCAL_LENGTH_LEN_MAX = 1.5, 10.0
+
+
+def _focal_length_scale_factor(focal_mm, ref1_scale, ref2_scale, lo=None, hi=None):
+    """Log-log interpolation (and, beyond the two references, extrapolation
+    - clamped to [lo, hi] when given) between a scale factor at
+    _FOCAL_LENGTH_REF1_MM (short) and one at _FOCAL_LENGTH_REF2_MM (medium)
+    - the same two reference focal lengths _focal_length_to_spike_length
+    uses, so every focal-length-derived default (Length, Thickness,
+    Intensity, the Minimum diameter cutoff) moves on one consistent curve
+    instead of each picking its own. A scale factor of 1.0 means "today's
+    hand-tuned default, unchanged" - these are relative multipliers, not
+    the absolute values _focal_length_to_spike_length returns. None for an
+    invalid/unknown focal length, same as that function."""
+    if not focal_mm or focal_mm <= 0:
+        return None
+    t = ((math.log(focal_mm) - math.log(_FOCAL_LENGTH_REF1_MM))
+         / (math.log(_FOCAL_LENGTH_REF2_MM) - math.log(_FOCAL_LENGTH_REF1_MM)))
+    log_scale = math.log(ref1_scale) + t * (math.log(ref2_scale) - math.log(ref1_scale))
+    scale = math.exp(log_scale)
+    if lo is not None:
+        scale = max(lo, scale)
+    if hi is not None:
+        scale = min(hi, scale)
+    return scale
+
+
+def _focal_length_to_spike_length(focal_mm):
+    """See the note above - returns None for an invalid/unknown focal
+    length (0, negative, or missing), leaving the caller's hand-tuned
+    defaults untouched."""
+    return _focal_length_scale_factor(
+        focal_mm, _FOCAL_LENGTH_REF1_LEN, _FOCAL_LENGTH_REF2_LEN,
+        _FOCAL_LENGTH_LEN_MIN, _FOCAL_LENGTH_LEN_MAX)
+
+
+# Thickness and Intensity aren't expressed "in star diameters" the way
+# Length is, so they don't automatically track the smaller absolute star
+# size a shorter focal length produces - Thickness (an absolute pixel
+# width) is scaled down a little at short focal length so the now-longer
+# default spike still reads as a thin, elegant needle rather than a thick
+# bar; Intensity is scaled up a little to match the bolder, more dramatic
+# look real short-focal-length wide-field photos tend to show. Both are
+# mild (unlike Length's 8x/3x swing) since over- or under-shooting either
+# is much more visually obvious than a length difference.
+_FOCAL_LENGTH_THICKNESS_SCALE_REFS = (0.85, 1.0)
+_FOCAL_LENGTH_INTENSITY_SCALE_REFS = (1.15, 1.0)
+_FOCAL_LENGTH_THICKNESS_SCALE_BOUNDS = (0.6, 1.2)
+_FOCAL_LENGTH_INTENSITY_SCALE_BOUNDS = (0.8, 1.6)
+# The Minimum star diameter cutoff is already calibrated per-image from
+# the real detected star sizes (see _reload_thread's size_calibration) -
+# self-adjusting for a shorter focal length's smaller stars without any
+# focal-length math at all. What focal length DOES still usefully inform:
+# how choosy that cutoff should be. "Diffraction spikes belong on the
+# biggest/brightest stars" holds at any focal length, but a short one
+# packs proportionally more small stars into the same cutoff band (a
+# coarser plate scale compresses the whole field's real size range into
+# fewer pixels), so the same percentile-based cutoff lets relatively more
+# of them through - scaled up a little here to stay selective.
+_FOCAL_LENGTH_MIN_DIAM_SCALE_REFS = (1.3, 1.0)
+_FOCAL_LENGTH_MIN_DIAM_SCALE_BOUNDS = (1.0, 1.6)
+
+
 SPIKE_DEFAULTS = {
     "enabled": True,
     "rays": 4,
@@ -212,19 +368,47 @@ SPIKE_DEFAULTS = {
     # anchor's own look (see TWINKLE_* below). 0 reproduces frankSpikes 2.1's
     # hard cutoff exactly.
     "twinkle": 20.0,
+    # How strictly the soft flare's ray pattern ("flare_rays") repeats in
+    # every wedge between main spikes: 100 = exactly (the spider geometry
+    # repeats around the aperture), 0 = every copy independently perturbed
+    # (scatter/seeing don't repeat). Reference photos sit in between -
+    # irregular spacing, but the strongest rays still hug every spike.
+    "flare_symmetry": 40.0,
+    # Diffraction rainbow segment spacing, in full-resolution px: the
+    # distance along a spike between successive nulls of the vane's own
+    # diffraction pattern (P = wavelength * focal length / (vane width *
+    # pixel size) - a property of the optics, so one value for every star
+    # in the frame, NOT a fraction of each spike's length). Measured on
+    # real reference photos: ~20-60px. See _diffraction_mult.
+    "rainbow_period": 40.0,
     "anchors": [
         {"diam": 3.0, "length": 2.0, "intensity": 40.0, "thickness": 0.8,
-         "soft_flare": 0.0, "flare_tail": 0.0, "ring_flare": 0.0, "chroma": 0.0,
-         "rainbow": 0.0, "saturation": 0.0},
-        {"diam": 8.0, "length": 4.0, "intensity": 110.0, "thickness": 1.1,
-         "soft_flare": 11.0, "flare_tail": 0.0, "ring_flare": 7.0, "chroma": 21.0,
-         # A real reference photo's spikes stay close to the star's own
-         # colour with at most a mild shift (see chroma above) - no cycling
-         # multi-hue "rainbow" by default. The slider itself stays available.
-         "rainbow": 0.0, "saturation": 0.0},
-        {"diam": 18.0, "length": 6.5, "intensity": 170.0, "thickness": 1.6,
-         "soft_flare": 35.0, "flare_tail": 0.0, "ring_flare": 20.0, "chroma": 45.0,
+         "soft_flare": 0.0, "flare_reach": 45.0, "ring_flare": 0.0, "ring_diam": 1.6,
+         "flare_saturation": 55.0, "flare_rays": 0.0,
          "rainbow": 0.0, "saturation": 55.0},
+        {"diam": 8.0, "length": 4.0, "intensity": 110.0, "thickness": 1.1,
+         "soft_flare": 11.0, "flare_reach": 45.0, "ring_flare": 7.0, "ring_diam": 1.6,
+         # flare_saturation matches this anchor's own (spike ray) saturation
+         # - the soft/ring flare glow used to stay pure white by default
+         # (flare_saturation=0) while only the thin rays picked up the
+         # star's colour, so a colourful ray met a white halo right where
+         # they overlap near the star - the exact spot most likely to catch
+         # the eye. Matching them keeps the whole star - halo and spikes -
+         # one coherent, visibly-tinted colour instead of a white core with
+         # a colour fringe (confirmed: a yellow star's white-to-yellow seam
+         # there read as a muddy sepia, not a clean yellow star).
+         "flare_saturation": 85.0, "flare_rays": 35.0,
+         # Every spike starts in the star's own colour; "rainbow" only
+         # adds the physical diffraction segments further out (see
+         # _diffraction_mult), whose spacing is the global
+         # "rainbow_period" - so a Medium star, whose spike is only a
+         # couple of periods long, shows just the first coloured band or
+         # two, while a Large one shows more.
+         "rainbow": 40.0, "saturation": 85.0},
+        {"diam": 18.0, "length": 6.5, "intensity": 170.0, "thickness": 1.6,
+         "soft_flare": 35.0, "flare_reach": 45.0, "ring_flare": 20.0, "ring_diam": 1.6,
+         "flare_saturation": 95.0, "flare_rays": 45.0,
+         "rainbow": 60.0, "saturation": 95.0},
     ],
 }
 
@@ -245,9 +429,35 @@ SPIKE_UNIFORM_REF_MULT = 4.0
 SPIKE_UNIFORM_DEFAULTS = {
     "min_diam": 3.0,
     "length": 5.0, "intensity": 140.0, "thickness": 1.0,
-    "soft_flare": 15.0, "flare_tail": 0.0, "ring_flare": 5.0, "chroma": 15.0,
-    "rainbow": 0.0, "saturation": 25.0,
+    "soft_flare": 15.0, "flare_reach": 45.0, "ring_flare": 5.0, "ring_diam": 1.6,
+    "flare_saturation": 75.0, "flare_rays": 40.0,
+    "rainbow": 45.0, "saturation": 75.0,
 }
+
+
+def compute_focal_calibration(focal_mm):
+    """The single source of truth for every focal-length-derived spike
+    default - used both by App._reload_thread (right after loading an
+    image) and by the Magic Wand button (App._on_magic_wand, to reapply it
+    on demand). Returns a dict with "length_scale"/"thickness_scale"/
+    "intensity_scale"/"diam_scale", each either a float multiplier (1.0 =
+    today's hand-tuned default, unchanged) or None if focal_mm is falsy/
+    invalid - see _focal_length_to_spike_length and
+    _focal_length_scale_factor for what each one means."""
+    if not focal_mm or focal_mm <= 0:
+        return {"length_scale": None, "thickness_scale": None,
+                "intensity_scale": None, "diam_scale": None}
+    target_uniform_length = _focal_length_to_spike_length(focal_mm)
+    return {
+        "length_scale": target_uniform_length / SPIKE_UNIFORM_DEFAULTS["length"],
+        "thickness_scale": _focal_length_scale_factor(
+            focal_mm, *_FOCAL_LENGTH_THICKNESS_SCALE_REFS, *_FOCAL_LENGTH_THICKNESS_SCALE_BOUNDS),
+        "intensity_scale": _focal_length_scale_factor(
+            focal_mm, *_FOCAL_LENGTH_INTENSITY_SCALE_REFS, *_FOCAL_LENGTH_INTENSITY_SCALE_BOUNDS),
+        "diam_scale": _focal_length_scale_factor(
+            focal_mm, *_FOCAL_LENGTH_MIN_DIAM_SCALE_REFS, *_FOCAL_LENGTH_MIN_DIAM_SCALE_BOUNDS),
+    }
+
 
 PALETTE = {
     "bg": "#0e1117",
@@ -320,6 +530,8 @@ def setup_style(root):
     style.configure("Muted.TLabel", background=P["bg"], foreground=P["muted"])
     style.configure("Card.TLabel", background=P["panel"], foreground=P["text"])
     style.configure("CardMuted.TLabel", background=P["panel"], foreground=P["muted"])
+    style.configure("CardHeading.TLabel", background=P["panel"], foreground=P["accent"],
+                     font=FONT_CARD_TITLE)
     style.configure("Header.TLabel", background=P["bg"], foreground=P["text"], font=FONT_HEADER)
     style.configure("SubHeader.TLabel", background=P["bg"], foreground=P["muted"], font=FONT_SUBHEADER)
     style.configure("Badge.TLabel", background=P["accent"], foreground="white",
@@ -480,37 +692,199 @@ def _gaussian_blur(gray, radius):
     return np.asarray(blurred).astype(np.float32) / 255.0
 
 
-def apply_cosmetics(rgb, exposure, temperature, tint, contrast, blacks, highlights,
-                     clarity, vibrance, saturation):
-    """Full light/tone/color pass on an (H,W,3) float [0,1] image. All 9
-    parameters are on a -100..100 scale, 0 = no change. Order: exposure,
-    then white balance (temperature/tint), then contrast, then black/white
-    point, then clarity (local contrast), then vibrance and saturation last
-    (act on the final color balance)."""
+# ---------------------------------------------------------------------------
+# Left panel ("camera raw"-style) tone/color controls: Base and Detail
+# groups for now (Tone Curve and HSL/Color Mixer are separate, larger
+# additions - see the module's own history/commits). Table-driven, same
+# pattern as SPIKE_ANCHOR_PARAM_DEFS/_SPIKE_PARAM_GROUP/
+# _build_grouped_anchor_sliders: one definition drives the tk.Var setup,
+# the collapsible-section UI and _update_all_labels, instead of one
+# hand-written line per parameter in each of those three places.
+# ---------------------------------------------------------------------------
+TONE_PARAM_DEFS = [
+    ("temperature", "Temperature (cool / warm)", -50, 50, 0.5, "{:.1f}"),
+    ("tint",        "Tint (green / magenta)",     -50, 50, 0.5, "{:.1f}"),
+    ("exposure",    "Exposure",                   -100, 100, 1, "{:.0f}"),
+    ("contrast",    "Contrast",                   -100, 100, 1, "{:.0f}"),
+    ("highlights",  "Highlights",                 -100, 100, 1, "{:.0f}"),
+    ("shadows",     "Shadows",                    -100, 100, 1, "{:.0f}"),
+    ("whites",      "Whites",                     -100, 100, 1, "{:.0f}"),
+    ("blacks",      "Blacks",                     -100, 100, 1, "{:.0f}"),
+    ("texture",     "Texture",                    -100, 100, 1, "{:.0f}"),
+    ("clarity",     "Clarity",                    -100, 100, 1, "{:.0f}"),
+    ("dehaze",      "Dehaze",                      -100, 100, 1, "{:.0f}"),
+    ("vibrance",    "Vibrance",                   -100, 100, 1, "{:.0f}"),
+    ("saturation",  "Saturation",                 -100, 100, 1, "{:.0f}"),
+]
+TONE_PARAM_GROUPS = ("base", "detail")
+TONE_PARAM_GROUP_TITLES = {"base": "Base", "detail": "Detail"}
+_TONE_PARAM_GROUP = {
+    "temperature": "base", "tint": "base", "exposure": "base", "contrast": "base",
+    "highlights": "base", "shadows": "base", "whites": "base", "blacks": "base",
+    "texture": "detail", "clarity": "detail", "dehaze": "detail",
+    "vibrance": "detail", "saturation": "detail",
+}
+TONE_DEFAULTS = {k: 0.0 for k, *_r in TONE_PARAM_DEFS}
+
+# White balance solved as the exact inverse of apply_cosmetics' own
+# temperature/tint formula (see compute_auto_tone) - kept as named
+# constants so the two stay in lockstep if that formula's own 0.15/0.5
+# factors are ever retuned.
+_WB_TEMP_TINT_STEP = 0.15
+_WB_TINT_CROSS_TERM = 0.5
+# Levels (Blacks/Whites) solved as the exact inverse of apply_cosmetics'
+# own black/white-point formula.
+_LEVELS_STEP = 0.3
+_AUTO_LEVELS_STRENGTH = 0.5  # 1.0 = textbook auto-levels (see compute_auto_tone)
+
+
+def compute_auto_tone(rgb):
+    """A conservative "auto white balance + auto levels" pass for the
+    Magic Wand button - meant to correct an objective light-pollution
+    color cast and a poorly-stretched black/white point, not to
+    reinterpret the image artistically. Returns a dict with just
+    "temperature"/"tint"/"blacks"/"whites" set (TONE_PARAM_DEFS keys, -100
+    ..100 scale) - Highlights/Shadows/Texture/Clarity/Dehaze/Vibrance/
+    Saturation are deliberately left for the caller to leave alone, since
+    "should this nebula pop more" is a taste call this function has no
+    business making ("rendendola naturale, senza snaturarla").
+
+    White balance is gray-world (equalizing the R/G/B means) but only over
+    the darkest quartile of pixels - a proxy for sky background, where any
+    color cast is light pollution, not real nebula/star color; gray-
+    -worlding the WHOLE image would just as happily wash out a genuine red
+    Halpha region. Levels stretches the 0.5th/99.5th luminance percentiles
+    toward (but not all the way to) black/white, gently rather than
+    clipping real detail.
+
+    Both are solved as the exact algebraic inverse of apply_cosmetics' own
+    temperature/tint and blacks/whites formulas (evaluated at the
+    background pixels' actual mean color, respectively the image's actual
+    dark/bright percentiles) rather than an iterative fit - cheap, and
+    exact for what it's targeting."""
+    luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+
+    bg_thresh = np.percentile(luma, 25)
+    bg_mask = luma <= max(bg_thresh, 1e-6)
+    if np.count_nonzero(bg_mask) < 100:
+        bg_mask = np.ones_like(luma, dtype=bool)  # fallback: a tiny/flat image
+    r_mean = float(np.mean(rgb[..., 0][bg_mask]))
+    g_mean = float(np.mean(rgb[..., 1][bg_mask]))
+    b_mean = float(np.mean(rgb[..., 2][bg_mask]))
+
+    # Solve temp_shift/tint_shift so R'=B'=G' at the background's own mean
+    # color - see apply_cosmetics' R'=R+temp+0.5*tint, G'=G-tint,
+    # B'=B-temp+0.5*tint (temp/tint here are already /100*0.15, i.e.
+    # "shift", not the raw slider value).
+    temp_shift = (b_mean - r_mean) / 2.0
+    tint_shift = (g_mean - r_mean - temp_shift) / 1.5
+    temperature = max(-50.0, min(50.0, temp_shift / _WB_TEMP_TINT_STEP * 100.0))
+    tint = max(-50.0, min(50.0, tint_shift / _WB_TEMP_TINT_STEP * 100.0))
+
+    # 0.1/99.9 rather than the more common 0.5/99.5: a sparse star field
+    # (plenty of real astro images - most of the frame is background, only
+    # a small fraction of pixels are actual stars) can have well under
+    # 0.5% genuinely bright pixels, which would otherwise put the "white
+    # point" percentile back in the background noise instead of on any
+    # real star - 99.9 only needs 0.1% to register correctly. Damped to
+    # half-strength on top of that: solving for the percentile to land
+    # EXACTLY at 0/1 is the textbook "auto levels" formula, but it's too
+    # heavy-handed as a one-click default - a well-exposed image that's
+    # merely a bit low-contrast (most real, already-processed frames)
+    # would otherwise get pushed all the way to a hard clip. Half strength
+    # nudges toward better levels without overriding a deliberate prior
+    # stretch.
+    lo_pct, hi_pct = np.percentile(luma, [0.1, 99.9])
+    bp = max(-_LEVELS_STEP, min(_LEVELS_STEP, float(lo_pct))) * _AUTO_LEVELS_STRENGTH
+    blacks = bp / _LEVELS_STEP * 100.0
+    wp = (float(hi_pct) - bp) / max(1e-6, 1.0 - bp)
+    wp = 1.0 - (1.0 - wp) * _AUTO_LEVELS_STRENGTH
+    wp = max(1e-6, min(1.5, wp))
+    whites = (1.0 - wp) / _LEVELS_STEP * 100.0
+    whites = max(-100.0, min(100.0, whites))
+
+    return {"temperature": temperature, "tint": tint, "blacks": blacks, "whites": whites}
+
+
+def apply_cosmetics(rgb, p):
+    """Full light/tone/color pass on an (H,W,3) float [0,1] image. `p` is a
+    dict keyed by TONE_PARAM_DEFS' own keys, each on a -100..100 scale (0 =
+    no change - every stage below is gated on its own param being nonzero,
+    so all-defaults is an exact identity, not just a near-no-op: cheap, and
+    what test_process_thread_ignores_hide_background relies on). Order:
+    exposure, white balance (temperature/tint), contrast, Highlights/
+    Shadows (tone-region masked, unlike Whites/Blacks below), Whites/Blacks
+    (hard clip-point stretch), Texture/Clarity/Dehaze (all local-contrast
+    variants at different radii), then Vibrance and Saturation last (act on
+    the final color balance).
+
+    Deliberately stops there: an earlier version also had a per-channel
+    Tone Curve and a per-hue-band HSL Color Mixer, removed after real use
+    showed they added exactly the kind of per-color decision-making this
+    tool is meant to spare the user from - see Magic Wand
+    (App._on_magic_wand) for the "make it look right without touching 24
+    individual sliders" alternative."""
     out = rgb.astype(np.float32).copy()
 
-    stops = exposure / 100.0 * 2.0
-    out = out * (2.0 ** stops)
+    exposure = p.get("exposure", 0.0)
+    if exposure:
+        stops = exposure / 100.0 * 2.0
+        out = out * (2.0 ** stops)
 
-    temp_shift = temperature / 100.0 * 0.15
-    tint_shift = tint / 100.0 * 0.15
-    out[..., 0] = out[..., 0] + temp_shift + tint_shift * 0.5   # R: warm + magenta
-    out[..., 1] = out[..., 1] - tint_shift                       # G: green <-> magenta axis
-    out[..., 2] = out[..., 2] - temp_shift + tint_shift * 0.5    # B: cool + magenta
-    out = np.clip(out, 0.0, 1.0)
+    temperature, tint = p.get("temperature", 0.0), p.get("tint", 0.0)
+    if temperature or tint:
+        temp_shift = temperature / 100.0 * 0.15
+        tint_shift = tint / 100.0 * 0.15
+        out[..., 0] = out[..., 0] + temp_shift + tint_shift * 0.5   # R: warm + magenta
+        out[..., 1] = out[..., 1] - tint_shift                       # G: green <-> magenta axis
+        out[..., 2] = out[..., 2] - temp_shift + tint_shift * 0.5    # B: cool + magenta
+        out = np.clip(out, 0.0, 1.0)
 
-    c_factor = 1.0 + contrast / 100.0
-    out = (out - 0.5) * c_factor + 0.5
+    contrast = p.get("contrast", 0.0)
+    if contrast:
+        c_factor = 1.0 + contrast / 100.0
+        out = (out - 0.5) * c_factor + 0.5
 
-    bp = float(np.clip(blacks / 100.0 * 0.3, -0.9, 0.9))
-    out = (out - bp) / max(1e-6, 1.0 - bp)
+    highlights, shadows = p.get("highlights", 0.0), p.get("shadows", 0.0)
+    if highlights or shadows:
+        # Tone-REGION controls (unlike Whites/Blacks below, which are a
+        # flat clip-point stretch over the whole range): a luminance-based
+        # weight mask that's ~1 only in the extreme highlights (resp.
+        # shadows) and fades to 0 by mid-grey, so only that tonal region
+        # moves - the classic "recover blown skies without flattening the
+        # midtones" behaviour, as opposed to Whites/Blacks' simpler global
+        # stretch.
+        luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        if highlights:
+            mask_hi = np.clip((luma - 0.5) / 0.5, 0.0, 1.0) ** 1.5
+            out = out + (mask_hi * (highlights / 100.0) * 0.5)[..., None]
+        if shadows:
+            mask_lo = np.clip((0.5 - luma) / 0.5, 0.0, 1.0) ** 1.5
+            out = out + (mask_lo * (shadows / 100.0) * 0.5)[..., None]
+        out = np.clip(out, 0.0, 1.0)
 
-    wp = 1.0 - float(np.clip(highlights / 100.0 * 0.3, -0.9, 0.9))
-    out = out / max(1e-6, wp)
+    blacks, whites = p.get("blacks", 0.0), p.get("whites", 0.0)
+    if blacks or whites:
+        bp = float(np.clip(blacks / 100.0 * 0.3, -0.9, 0.9))
+        out = (out - bp) / max(1e-6, 1.0 - bp)
+        wp = 1.0 - float(np.clip(whites / 100.0 * 0.3, -0.9, 0.9))
+        out = out / max(1e-6, wp)
+        out = np.clip(out, 0.0, 1.0)
 
-    out = np.clip(out, 0.0, 1.0)
+    texture = p.get("texture", 0.0)
+    if texture:
+        # Fine (high-frequency) detail - a much smaller unsharp radius than
+        # Clarity below, so it affects grain/fine structure rather than
+        # broad mid-tone shape.
+        h, w = out.shape[:2]
+        radius = max(1, int(round(min(h, w) * 0.003)))
+        luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        detail = luma - _gaussian_blur(luma, radius)
+        out = out + (detail * (texture / 100.0))[..., None]
+        out = np.clip(out, 0.0, 1.0)
 
-    if clarity != 0:
+    clarity = p.get("clarity", 0.0)
+    if clarity:
         # Local (mid-tone) contrast: unsharp-mask the luminance with a large
         # radius (~1% of the shorter side) and add the extracted detail back
         # into every channel equally, so structure pops without a color
@@ -522,7 +896,28 @@ def apply_cosmetics(rgb, exposure, temperature, tint, contrast, blacks, highligh
         out = out + (detail * (clarity / 100.0) * 1.5)[..., None]
         out = np.clip(out, 0.0, 1.0)
 
-    if vibrance != 0:
+    dehaze = p.get("dehaze", 0.0)
+    if dehaze:
+        # A simplified stand-in for real (depth-aware) dehazing: haze
+        # flattens both local contrast and saturation, so this pushes a
+        # much larger-radius unsharp mask than Clarity (haze is a very
+        # low-frequency veil, not mid-tone structure) together with a
+        # saturation nudge in the same direction - negative values soften
+        # and desaturate instead, for an artistic "add atmosphere" effect.
+        h, w = out.shape[:2]
+        radius = max(3, int(round(min(h, w) * 0.03)))
+        amt = dehaze / 100.0
+        luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        detail = luma - _gaussian_blur(luma, radius)
+        out = out + (detail * amt * 1.3)[..., None]
+        out = np.clip(out, 0.0, 1.0)
+        luma2 = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        sat_factor = 1.0 + amt * 0.4
+        out = luma2[..., None] + (out - luma2[..., None]) * sat_factor
+        out = np.clip(out, 0.0, 1.0)
+
+    vibrance = p.get("vibrance", 0.0)
+    if vibrance:
         # Unlike Saturation (flat boost everywhere), Vibrance pushes weakly
         # saturated pixels harder and already-vivid ones (e.g. a strong Ha
         # red) less, so it doesn't clip colors that are already intense.
@@ -534,9 +929,12 @@ def apply_cosmetics(rgb, exposure, temperature, tint, contrast, blacks, highligh
         out = luma[..., None] + (out - luma[..., None]) * v_factor[..., None]
         out = np.clip(out, 0.0, 1.0)
 
-    luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
-    s_factor = 1.0 + saturation / 100.0
-    out = luma[..., None] + (out - luma[..., None]) * s_factor
+    saturation = p.get("saturation", 0.0)
+    if saturation:
+        luma = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
+        s_factor = 1.0 + saturation / 100.0
+        out = luma[..., None] + (out - luma[..., None]) * s_factor
+        out = np.clip(out, 0.0, 1.0)
 
     return np.clip(out, 0.0, 1.0)
 
@@ -799,6 +1197,174 @@ def detect_saturated_stars(full_rgb, existing_stars, bright_floor=0.90,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Standalone (no Siril) mode: FITS/TIFF file I/O and star detection, used by
+# FileWorker in place of sirilpy's pixeldata/get_image_stars calls. Kept as
+# free functions (not methods) so they're independently testable, and all
+# three extra imports (astropy, photutils, tifffile) are lazy - a Siril-
+# connected session never needs them, so a missing package there shouldn't
+# break anything; a standalone one gets a clear ImportError message instead
+# of a confusing failure deep in a background thread.
+# ---------------------------------------------------------------------------
+
+def _normalize_float01(arr):
+    """Best-effort 0-1 rescale for a float FITS/TIFF array that isn't
+    already in that range (e.g. a linear/calibrated master still in raw ADU
+    counts) - frankSpikes expects an already display-ready image, the same
+    assumption the Siril-connected mode makes about its own pixeldata (see
+    to_float01). Left untouched if it already looks normalized."""
+    lo, hi = float(np.nanmin(arr)), float(np.nanmax(arr))
+    if hi <= 1.5 and lo >= -0.05:
+        return arr
+    span = hi - lo
+    if span <= 0:
+        return np.zeros_like(arr)
+    return ((arr - lo) / span).astype(np.float32)
+
+
+def _load_fits(path):
+    """Loads a FITS file into the same "raw" (row 0 = bottom, FITS' own
+    native order) (H,W,3) float01 contract SirilWorker.fetch_full() returns
+    - see FileWorker's class docstring for why this matters."""
+    from astropy.io import fits
+    with fits.open(path) as hdul:
+        data = None
+        for hdu in hdul:
+            if getattr(hdu, "data", None) is not None:
+                data = hdu.data
+                break
+    if data is None:
+        raise ValueError("No image data found in this FITS file.")
+    data = np.asarray(data)
+    out = to_hwc(to_float01(data))
+    if np.issubdtype(data.dtype, np.floating):
+        out = _normalize_float01(out)
+    return out
+
+
+def _read_fits_focal_length(path):
+    """The telescope's focal length in mm, from the standard FOCALLEN FITS
+    keyword - None if missing/zero/unparsable (not every FITS file carries
+    it) or on any error, so the caller falls back to the hand-tuned
+    defaults. Reads only the header (no pixel data), so this is cheap even
+    on a large file."""
+    try:
+        from astropy.io import fits
+        with fits.open(path) as hdul:
+            for hdu in hdul:
+                fl = hdu.header.get("FOCALLEN")
+                if fl:
+                    fl = float(fl)
+                    return fl if fl > 0 else None
+    except Exception:
+        pass
+    return None
+
+
+def _save_fits(path, rgb_display, bit_depth):
+    """rgb_display is (H,W,3) float01 in display convention (row 0 = top,
+    the same convention App hands to SirilWorker.push_rgb) - FITS' own
+    on-disk convention is row 0 = bottom, so this flips once before writing,
+    mirroring SirilWorker.push_rgb's own display -> raw flip."""
+    from astropy.io import fits
+    raw = rgb_display[::-1, :, :]
+    chw = np.transpose(np.clip(raw, 0.0, 1.0), (2, 0, 1))
+    if bit_depth == 16:
+        data = (chw * 65535.0 + 0.5).astype(np.uint16)
+    else:
+        data = chw.astype(np.float32)
+    fits.PrimaryHDU(data=data).writeto(path, overwrite=True)
+
+
+def _load_tiff(path):
+    """Loads a TIFF file into the same "raw" (H,W,3) float01 contract
+    _load_fits() above does - TIFF's own native raster order is row 0 = top
+    (the opposite of FITS), so it's flipped once here to match."""
+    import tifffile
+    arr = np.asarray(tifffile.imread(path))
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3:
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        elif arr.shape[-1] == 4:
+            arr = arr[..., :3]  # drop alpha
+        elif arr.shape[-1] != 3:
+            raise ValueError(f"Unsupported TIFF channel layout: {arr.shape}")
+    else:
+        raise ValueError(f"Unsupported TIFF shape: {arr.shape}")
+    out = to_float01(arr)
+    if np.issubdtype(arr.dtype, np.floating):
+        out = _normalize_float01(out)
+    return out[::-1, :, :]  # top-down (native) -> raw (bottom-up), see docstring
+
+
+def _save_tiff(path, rgb_display, bit_depth):
+    """rgb_display is (H,W,3) float01 in display convention (row 0 = top) -
+    already TIFF's own native raster order, so no flip is needed here
+    (unlike _save_fits above)."""
+    import tifffile
+    arr = np.clip(rgb_display, 0.0, 1.0)
+    if bit_depth == 16:
+        data = (arr * 65535.0 + 0.5).astype(np.uint16)
+    elif bit_depth == 8:
+        data = (arr * 255.0 + 0.5).astype(np.uint8)
+    else:
+        data = arr.astype(np.float32)
+    tifffile.imwrite(path, data)
+
+
+def _detect_stars_standalone(raw_rgb, max_stars=6000):
+    """Star detection for standalone (no-Siril) mode, replacing Siril's own
+    'findstar' command. photutils' DAOStarFinder does the actual general-
+    purpose peak finding (the same job findstar does); it doesn't report a
+    usable per-star FWHM itself (its own output columns are sharpness/
+    roundness, not size), so _measure_bright_star_profile - already used
+    above for the saturated-star supplement - measures a real fwhm/
+    amplitude from each candidate's own pixel profile instead, keeping
+    star-size semantics identical regardless of which detector found it.
+
+    raw_rgb is in the same raw (row 0 = bottom) convention as
+    FileWorker.fetch_full()'s return value; returns (x, y, fwhm, amplitude)
+    tuples with y in that SAME raw convention - the y-flip to the display
+    convention get_stars() must return happens in FileWorker.get_stars(),
+    not here, matching how SirilWorker keeps that flip out of this
+    lower-level detection step too."""
+    from astropy.stats import sigma_clipped_stats
+    from photutils.detection import DAOStarFinder
+
+    luma = (0.299 * raw_rgb[..., 0] + 0.587 * raw_rgb[..., 1]
+            + 0.114 * raw_rgb[..., 2]).astype(np.float64)
+    _mean, median, std = sigma_clipped_stats(luma, sigma=3.0, maxiters=5)
+    if not (std > 0):
+        return []
+    # photutils renamed the "cap the candidate count" kwarg (brightest ->
+    # n_brightest) and the result table's centroid columns (xcentroid/
+    # ycentroid -> x_centroid/y_centroid) across major versions still in
+    # use (2.x on Siril's own bundled venv, 3.x+ elsewhere) - handled
+    # dynamically rather than pinning to one version's naming.
+    try:
+        finder = DAOStarFinder(fwhm=3.0, threshold=5.0 * std, n_brightest=max_stars)
+    except TypeError:
+        finder = DAOStarFinder(fwhm=3.0, threshold=5.0 * std, brightest=max_stars)
+    table = finder(luma - median)
+    if table is None or len(table) == 0:
+        return []
+    xcol = "x_centroid" if "x_centroid" in table.colnames else "xcentroid"
+    ycol = "y_centroid" if "y_centroid" in table.colnames else "ycentroid"
+
+    h, w = luma.shape
+    out = []
+    for row in table:
+        x, y = float(row[xcol]), float(row[ycol])
+        xi, yi = min(w - 1, max(0, int(round(x)))), min(h - 1, max(0, int(round(y))))
+        peak = float(luma[yi, xi])
+        fwhm, amplitude = _measure_bright_star_profile(luma, x, y, peak)
+        if fwhm > 0:
+            out.append((x, y, fwhm, amplitude))
+    return out
+
+
 def _rotate_hue(rgb, degrees):
     """Rotate the hue of a normalized (r,g,b) colour by `degrees`, keeping
     its saturation/value. Used to let the user dial the star-colour spikes
@@ -831,44 +1397,97 @@ def _rotate_hue(rgb, degrees):
     return (rp + m, gp + m, bp + m)
 
 
-def _spike_color_mult(t, star_color, chroma, rainbow, saturation):
-    """Per-pixel (R,G,B) colour multipliers for a point at fractional
-    distance t (0=star, 1=tip) along a ray. The base colour is the star's
-    own (already hue-rotated) colour; two more effects layer on top of it,
-    then the whole thing is faded toward neutral white by `saturation`
-    (0 = pure white spike regardless of the star's colour or the other two
-    sliders, 100 = full colour):
-    - chroma: a physically-styled two-tone gradient, blue-ish near the
-      star, warm near the tip (real diffraction spreads longer wavelengths
-      further).
-    - rainbow: an artistic multi-hue cycle along the ray's length, for the
-      flashier prism-like look some presets go for.
-    """
-    r_col, g_col, b_col = star_color
-    warm = min(1.0, chroma / 100.0) * 1.8
-    r_mult = 1.0 + warm * t
-    g_mult = 1.0
-    b_mult = 1.0 + warm * (1.0 - t) * 0.6
-
-    if rainbow > 0:
-        amt = min(1.0, rainbow / 100.0)
-        freq = 1.6  # fixed number of colour cycles along the ray
-        rb_r = 0.5 + 0.5 * np.cos(2 * np.pi * (t * freq + 0.00))
-        rb_g = 0.5 + 0.5 * np.cos(2 * np.pi * (t * freq + 0.33))
-        rb_b = 0.5 + 0.5 * np.cos(2 * np.pi * (t * freq + 0.66))
-        r_mult = r_mult * (1 - amt) + (0.4 + 1.6 * rb_r) * amt
-        g_mult = g_mult * (1 - amt) + (0.4 + 1.6 * rb_g) * amt
-        b_mult = b_mult * (1 - amt) + (0.4 + 1.6 * rb_b) * amt
-
-    r_full = r_col * r_mult
-    g_full = g_col * g_mult
-    b_full = b_col * b_mult
-
+def _spike_color_mult(star_color, saturation):
+    """(R,G,B) colour multipliers for the star's own (already hue-rotated)
+    colour, faded toward neutral white by `saturation` (0 = pure white
+    regardless of the star's colour, 100 = full colour). Used for the
+    spike rays' base colour (before _diffraction_mult's rainbow segments)
+    and for the soft/ring flare tint."""
     sat = min(1.0, max(0.0, saturation / 100.0))
-    r_final = 1.0 + (r_full - 1.0) * sat
-    g_final = 1.0 + (g_full - 1.0) * sat
-    b_final = 1.0 + (b_full - 1.0) * sat
-    return r_final, g_final, b_final
+    return tuple(1.0 + (c - 1.0) * sat for c in star_color)
+
+
+# Polychromatic diffraction model behind the "rainbow" control. A spider
+# vane of finite width w diffracts light into a spike whose brightness
+# along its length follows sinc^2(pi * r / P_lambda), with nulls every
+# P_lambda = lambda * f / w (in px) - wavelength dependent, so blue's
+# nulls fall closer to the star than red's. Summed over the visible
+# spectrum that gives exactly what reference photos show: the spike
+# starts in the star's own colour (every wavelength still in phase), then
+# breaks into short coloured segments with dimmer gaps (yellow -> red ->
+# magenta -> blue -> cyan -> green -> yellow ... outward, measured on real
+# photos), washing back to neutral after 2-3 orders as the orders overlap.
+_DIFFR_LAMBDAS = np.linspace(420.0, 680.0, 14)
+_DIFFR_LAMBDA_REF = 550.0
+
+
+def _diffr_gauss(x, mu, sigma):
+    return np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+
+# Rough sRGB response per sampled wavelength (R also has the small violet
+# lobe that makes the far blue end read as purple), each channel's weights
+# normalised to sum to 1 - so "every wavelength at full strength" is
+# exactly (1,1,1), i.e. the star's own colour untouched.
+_DIFFR_RGB_WEIGHTS = np.stack([
+    _diffr_gauss(_DIFFR_LAMBDAS, 600.0, 35.0) + 0.15 * _diffr_gauss(_DIFFR_LAMBDAS, 445.0, 18.0),
+    _diffr_gauss(_DIFFR_LAMBDAS, 540.0, 38.0),
+    _diffr_gauss(_DIFFR_LAMBDAS, 455.0, 25.0),
+], axis=1)
+_DIFFR_RGB_WEIGHTS = (_DIFFR_RGB_WEIGHTS / _DIFFR_RGB_WEIGHTS.sum(axis=0)).astype(np.float32)
+# Brightness left at a single wavelength's null (a pure sinc^2 would drop
+# to 0 - reference photos only dip to roughly half of the neighbouring
+# segments once the spectrum is summed, sensor/seeing blur included).
+DIFFR_NULL_FLOOR = 0.3
+# How many orders stay distinctly coloured before blurring back to
+# neutral (reference photos: 2-3).
+DIFFR_ORDERS = 2.5
+
+
+def _diffraction_mult(dist_px, period_px, amount, saturation):
+    """Per-pixel (R,G,B) multipliers (each an array shaped like dist_px)
+    for the diffraction rainbow at distance dist_px from the star along a
+    spike. period_px is the null spacing at 550nm in the same px units as
+    dist_px. amount (0-100) blends from no effect (1,1,1) to the full
+    physical modulation; saturation (0-100, the ray's Color saturation)
+    scales only its hue part - at 0 the segments stay, but grey."""
+    ones = np.ones_like(dist_px, dtype=np.float32)
+    if amount <= 0 or period_px <= 0:
+        return ones, ones, ones
+    a = min(1.0, amount / 100.0)
+    x = np.maximum(dist_px, 0.0)[..., None] / (period_px * _DIFFR_LAMBDAS / _DIFFR_LAMBDA_REF)
+    # sinc^2 main lobe near the star, then sin^2 (the sidelobes with their
+    # 1/x^2 decay divided out - the overall fade along the spike is the
+    # separate power-law envelope in _add_spike_ray, not this) - the two
+    # meet continuously at x = 1/pi.
+    m = np.where(x < 1.0 / np.pi, np.sinc(x) ** 2, np.sin(np.pi * x) ** 2)
+    # Higher orders blur toward their mean (0.5): real light is a
+    # continuum, not 14 samples, so the colours wash out instead of
+    # re-aligning into spurious bright bands further out.
+    wash = 1.0 / (1.0 + (x / DIFFR_ORDERS) ** 2)
+    m = np.where(x < 1.0, m, 0.5 + (m - 0.5) * wash)
+    m = DIFFR_NULL_FLOOR + (1.0 - DIFFR_NULL_FLOOR) * m
+    rgb = np.tensordot(m.astype(np.float32), _DIFFR_RGB_WEIGHTS, axes=([-1], [0]))
+    rgb = 1.0 + a * (rgb - 1.0)
+    lum = rgb.mean(axis=-1, keepdims=True)
+    sat = min(1.0, max(0.0, saturation / 100.0))
+    rgb = lum + (rgb - lum) * sat
+    return rgb[..., 0], rgb[..., 1], rgb[..., 2]
+
+
+def _spike_flicker(dist_full_px, seed, amount):
+    """Slow, irregular brightness fluctuation along a spike (reference
+    photos: roughly +-20-40% around the smooth falloff) - a few
+    incommensurate sine waves in full-resolution px (so it doesn't change
+    with zoom) with phases from `seed` (deterministic per star and ray)."""
+    if amount <= 0:
+        return 1.0
+    pa, pb = _star_jitter_pair(seed, seed * 0.37 + 11.0)
+    pc, _ = _star_jitter_pair(seed * 1.91 + 5.0, seed)
+    n = (np.sin(2 * np.pi * dist_full_px / 23.0 + pa * np.pi) +
+         0.8 * np.sin(2 * np.pi * dist_full_px / 41.0 + pb * np.pi) +
+         0.6 * np.sin(2 * np.pi * dist_full_px / 67.0 + pc * np.pi)) / 1.6
+    return np.maximum(0.0, 1.0 + amount * n)
 
 
 def _soft_knee(x, knee=0.75):
@@ -888,17 +1507,36 @@ def _soft_knee(x, knee=0.75):
     return np.where(x > knee, knee + span * (1.0 - np.exp(-over / span)), x)
 
 
+# Spike brightness along its length: a power law (1 + r/r0)^-k measured on
+# reference photos (k ~ 0.7-2 in display space), r0 a fraction of the
+# spike's own length, then a smooth fade over the last part so it still
+# ends at Length instead of trailing off forever.
+SPIKE_FALLOFF_EXP = 1.0
+SPIKE_FALLOFF_R0_FRAC = 0.2
+SPIKE_TIP_FADE_START = 0.55
+# Width along the spike: real spikes don't taper to a point - they keep
+# their width, even broadening slightly (reference photos: +20-40% at the
+# tip), and just fade out.
+SPIKE_WIDTH_GROWTH = 0.3
+# Along-spike brightness fluctuation amplitude (see _spike_flicker).
+SPIKE_FLICKER = 0.2
+
+
 def _add_spike_ray(layer, cx, cy, angle_deg, length_px, thickness_px, peak,
-                    star_color, chroma, rainbow, saturation):
-    """Add one tapered, glowing half-ray from (cx, cy) outward at angle_deg
-    into an (H,W,3) additive layer. The ray stays close to full brightness
-    for most of its length and only tapers hard near the very tip (matching
-    how dramatic diffraction-spike presets look, rather than a physically
-    exact 1/r falloff that would read as barely visible)."""
+                    star_color, rainbow, saturation, period_px=0.0,
+                    px_scale=1.0, flicker_seed=0.0, flicker=0.0):
+    """Add one glowing half-ray from (cx, cy) outward at angle_deg into an
+    (H,W,3) additive layer. Brightness follows the power-law falloff above
+    (brightest at the star, long faint tail, fading out at length_px),
+    width stays constant/slightly growing, and - with rainbow > 0 and
+    period_px > 0 (null spacing in the layer's own px) - the diffraction
+    rainbow segments of _diffraction_mult. px_scale (layer px per full-
+    resolution px) keeps the flicker pattern fixed in the real image
+    regardless of zoom; flicker_seed makes it differ per star/ray."""
     if length_px < 1.0 or peak <= 0:
         return
     h, w, _ = layer.shape
-    pad = thickness_px + 1.0
+    pad = thickness_px * (1.0 + SPIKE_WIDTH_GROWTH) * 3.0 + 1.0
     x0 = int(max(0, np.floor(cx - length_px - pad)))
     x1 = int(min(w, np.ceil(cx + length_px + pad)))
     y0 = int(max(0, np.floor(cy - length_px - pad)))
@@ -915,47 +1553,162 @@ def _add_spike_ray(layer, cx, cy, angle_deg, length_px, thickness_px, peak,
     perp = np.abs(-dx * dir_y + dy * dir_x)
 
     t = np.clip(along / max(length_px, 1e-6), 0.0, 1.0)
-    # Rays taper slightly (thinner toward the tip than at the star's core).
-    # The 0.3 floor used to be large enough to visibly override a genuinely
-    # thin thickness_px at low preview scale - the same class of preview/
-    # Process mismatch as the outer floor already removed from
-    # render_spike_layer. Kept tiny here only to avoid a division by ~0.
-    local_thickness = thickness_px * (1.0 - 0.35 * t)
+    local_thickness = thickness_px * (1.0 + SPIKE_WIDTH_GROWTH * t)
     perp_falloff = np.exp(-(perp ** 2) / (2.0 * np.maximum(local_thickness, 0.02) ** 2))
-    # Along the ray: a soft bulge right at the star, a long near-full-
-    # brightness run, then a fade only in the last stretch toward the tip.
+    r0 = max(SPIKE_FALLOFF_R0_FRAC * length_px, 1e-3)
+    envelope = (1.0 + np.maximum(along, 0.0) / r0) ** -SPIKE_FALLOFF_EXP
+    fade_t = np.clip((t - SPIKE_TIP_FADE_START) / (1.0 - SPIKE_TIP_FADE_START), 0.0, 1.0)
+    envelope = envelope * (1.0 - fade_t * fade_t * (3.0 - 2.0 * fade_t))
+    # Behind the star: a soft bulge only, as before.
     along_falloff = np.where(
         along < 0,
         np.exp(-(along ** 2) / (2.0 * (thickness_px * 1.5) ** 2)),
-        (1.0 - t) ** 0.55,
+        envelope * _spike_flicker(np.maximum(along, 0.0) / max(px_scale, 1e-6),
+                                  flicker_seed, flicker),
     )
     mask = along <= length_px
     base = _soft_knee(peak * perp_falloff * along_falloff * mask)
 
-    r_mult, g_mult, b_mult = _spike_color_mult(t, star_color, chroma, rainbow, saturation)
-    layer[y0:y1, x0:x1, 0] = np.maximum(layer[y0:y1, x0:x1, 0], base * r_mult)
-    layer[y0:y1, x0:x1, 1] = np.maximum(layer[y0:y1, x0:x1, 1], base * g_mult)
-    layer[y0:y1, x0:x1, 2] = np.maximum(layer[y0:y1, x0:x1, 2], base * b_mult)
+    sr, sg, sb = _spike_color_mult(star_color, saturation)
+    if rainbow > 0 and period_px > 0:
+        # Depends only on `along`: evaluate the (14-wavelength) model once
+        # on a fine 1D table and interpolate, instead of per pixel of the
+        # whole bounding box (~6x slower at full resolution otherwise).
+        grid = np.linspace(0.0, length_px, max(8, int(length_px * 4) + 1), dtype=np.float32)
+        tr, tg, tb = _diffraction_mult(grid, period_px, rainbow, saturation)
+        a_clip = np.clip(along, 0.0, length_px)
+        dr = np.interp(a_clip, grid, tr)
+        dg = np.interp(a_clip, grid, tg)
+        db = np.interp(a_clip, grid, tb)
+    else:
+        dr = dg = db = 1.0
+    layer[y0:y1, x0:x1, 0] = np.maximum(layer[y0:y1, x0:x1, 0], base * sr * dr)
+    layer[y0:y1, x0:x1, 1] = np.maximum(layer[y0:y1, x0:x1, 1], base * sg * dg)
+    layer[y0:y1, x0:x1, 2] = np.maximum(layer[y0:y1, x0:x1, 2], base * sb * db)
 
 
-def _add_soft_flare(layer, cx, cy, radius_px, peak, tail_len_px=0.0):
-    """A large, very soft circular glow around the star in every direction
-    (not just along the rays) - mimics sensor/optics bloom around bright
-    stars. With tail_len_px > 0 a power-law tail (equal to the gaussian at
-    2 sigma, so no seam) extends the glow out to that radius; 0 keeps the
-    original gaussian-only glow bit for bit."""
-    if radius_px < 1.0 or peak <= 0:
+# Ray structure inside the soft flare (the "Flare rays" control). Measured
+# on reference photos (Downloads/esempi): the sunburst around a bright star
+# isn't a set of evenly spaced lines on black but a 15-40% modulation of
+# the soft halo itself - 24-48 soft streaks (2-4 px, several degrees wide
+# near the core), irregularly spaced (gap CV ~0.35-0.6) with very uneven
+# brightness (CV ~0.5-0.7), more of them further out (rays branch), and
+# the strongest ones hugging the main spikes (within ~10 deg, 1.5-3x
+# brighter) as faint secondary spikes. FLARE_RAY_COUNT is the total
+# number of base rays around the star (split evenly into one set per main
+# spike wedge, so the symmetric part can repeat every wedge).
+FLARE_RAY_COUNT = 48
+# Max table resolution (radial bands x angle samples) - smaller flares use
+# less (about 2 samples per px of the outer circumference), which is all
+# the pixel grid can show anyway.
+FLARE_RAY_BANDS = 10
+FLARE_RAY_ANGLE_SAMPLES = 1440  # 0.25 deg
+
+
+def _flare_ray_table(n_spikes, rotation_deg, symmetry, seed, radius_px, fwhm_px):
+    """(bands, angle samples) table of the flare's angular ray pattern,
+    normalised to mean 1 in every band, plus the band radii (px).
+    symmetry (0-1): 1 = the same rays repeat exactly in every wedge between
+    main spikes (the spider geometry repeats around the aperture), 0 =
+    every copy is independently perturbed (scatter/seeing don't repeat)."""
+    rng = np.random.default_rng(seed)
+    n_spikes = max(1, int(n_spikes))
+    wedge = 360.0 / n_spikes
+    k = max(2, FLARE_RAY_COUNT // n_spikes)
+    # One wedge's worth of base rays: offset from its spike (deg),
+    # amplitude, width (px), start/end radius (fraction of radius_px).
+    base = []
+    # Stratified: one ray per equal slot (jittered inside it), so they
+    # spread all around the star like a real sunburst instead of randomly
+    # clumping into a few diffuse bundles.
+    for slot in range(k):
+        branch = rng.random() < 0.3
+        base.append([(slot + rng.uniform(0.15, 0.85)) * wedge / k, rng.lognormal(0.0, 0.6),
+                     fwhm_px * rng.uniform(0.02, 0.05),
+                     rng.uniform(0.15, 0.5) if branch else 0.0,
+                     rng.uniform(0.6, 1.0)])
+        if branch and len(base) > 1:
+            # a branch sits right next to an existing ray
+            base[-1][0] = (base[rng.integers(0, len(base) - 1)][0] +
+                           rng.choice((-1.0, 1.0)) * rng.uniform(1.0, 3.0)) % wedge
+    med = float(np.median([b[1] for b in base]))
+    # Secondary spikes: the rays that already fall within ~9 deg of a main
+    # spike are made a little stronger (reference photos: ~1.4x overall,
+    # jitter and branching already add some of that) - boosting
+    # existing rays rather than adding extra ones, which would double the
+    # ray density there and turn the flare into a few diffuse spikes
+    # instead of an even sunburst.
+    for b in base:
+        if min(b[0], wedge - b[0]) < 9.0:
+            b[1] *= rng.uniform(1.05, 1.3)
+    spacing = wedge / len(base)
+    rays = []
+    for i in range(n_spikes):
+        spike = rotation_deg + i * wedge
+        for off, amp, width, r0, r1 in base:
+            j_ang = rng.uniform(-0.8, 0.8) * spacing
+            j_amp = rng.lognormal(0.0, 0.6)
+            j_r0 = rng.uniform(0.0, 0.4) if r0 > 0 else 0.0
+            j_r1 = rng.uniform(0.6, 1.0)
+            s = symmetry
+            rays.append((spike + off + (1.0 - s) * j_ang,
+                         amp ** s * (j_amp * (amp / max(med, 1e-6)) ** 0.5) ** (1.0 - s),
+                         width, s * r0 + (1.0 - s) * j_r0, s * r1 + (1.0 - s) * j_r1))
+
+    n_b = int(np.clip(radius_px / 6.0, 4, FLARE_RAY_BANDS))
+    n_t = int(np.clip(4.0 * np.pi * radius_px, 180, FLARE_RAY_ANGLE_SAMPLES))
+    bands = np.linspace(0.08, 1.0, n_b) * radius_px
+    theta = np.linspace(0.0, 360.0, n_t, endpoint=False, dtype=np.float32)
+    ang, amp, width, r0, r1 = (np.array(c, dtype=np.float32)[:, None] for c in zip(*rays))
+    f = (bands / max(radius_px, 1e-6))[None, :]                  # (1, bands)
+    # smooth start (branches appear) and end (rays fade out) - (rays, bands)
+    win = (np.clip((f - r0) / 0.12, 0.0, 1.0) *
+           np.clip((r1 - f) / 0.25 + 1.0, 0.0, 1.0) * np.clip((1.0 - f) / 0.2 + 1.0, 0.0, 1.0))
+    # width in px grows slightly outward; as an angle it narrows
+    sig = np.degrees(np.maximum(width, 0.5) * (1.0 + 0.5 * f) / np.maximum(bands[None, :], 1e-6))
+    # capped at 3 deg: wider rays near the core merge into broad wedges
+    sig = np.clip(sig, max(0.25, 360.0 / n_t), 3.0)
+    d = (theta[None, :] - ang + 180.0) % 360.0 - 180.0             # (rays, angles)
+    table = np.einsum("rb,rbt->bt", amp * win,
+                      np.exp(-0.5 * (d[:, None, :] / sig[:, :, None]) ** 2)).astype(np.float32)
+    table /= np.maximum(table.mean(axis=1, keepdims=True), 1e-6)
+    return table, bands
+
+
+def _flare_ray_field(r, theta_deg, table, bands):
+    """Bilinear lookup of _flare_ray_table at polar coordinates (r px,
+    theta deg)."""
+    n_b, n_t = table.shape
+    fb = np.interp(r, bands, np.arange(n_b, dtype=np.float32))
+    b0 = np.floor(fb).astype(np.int32)
+    b1 = np.minimum(b0 + 1, n_b - 1)
+    wb = fb - b0
+    ft = (theta_deg % 360.0) / 360.0 * n_t
+    t0 = np.floor(ft).astype(np.int32) % n_t
+    t1 = (t0 + 1) % n_t
+    wt = ft - np.floor(ft)
+    top = table[b0, t0] * (1 - wt) + table[b0, t1] * wt
+    bot = table[b1, t0] * (1 - wt) + table[b1, t1] * wt
+    return top * (1 - wb) + bot * wb
+
+
+def _add_soft_flare(layer, cx, cy, core_px, reach_px, peak,
+                     color_mult=(1.0, 1.0, 1.0), rays=0.0, n_spikes=4,
+                     rotation_deg=0.0, symmetry=0.5, seed=0, fwhm_px=1.0):
+    """The star's scattered-light flare: a soft power-law glow around the
+    star in every direction (sensor/optics bloom), ending smoothly at
+    reach_px - plus, with rays > 0 (0-100), the soft irregular streaks of
+    a real sunburst (see _flare_ray_table), which start right at the
+    star's visible edge (core_px) so they show just outside the core even
+    for a short reach, rather than hiding inside it. color_mult (r,g,b),
+    from _spike_color_mult, tints it toward the star's own colour. The
+    main spikes' count/rotation place the secondary spikes, symmetry (0-1)
+    is how strictly the pattern repeats every wedge, seed makes it differ
+    per star, fwhm_px sets the ray width."""
+    if reach_px < 1.0 or peak <= 0:
         return
     h, w, _ = layer.shape
-    sigma = radius_px * 0.5
-    # The old box only extended to radius_px+1 (~2 sigma), where the
-    # Gaussian is still at ~14% of its peak - the hard edge of that square
-    # bounding box then showed up as a visible square around the glow,
-    # worse the bigger the star. 3 sigma decays to ~1%, small enough that
-    # clipping it there reads as a clean circular falloff instead.
-    pad = sigma * 3.0 + 1.0
-    if tail_len_px > 0:
-        pad = max(pad, tail_len_px + 1.0)
+    pad = reach_px + 1.0
     x0 = int(max(0, np.floor(cx - pad)))
     x1 = int(min(w, np.ceil(cx + pad)))
     y0 = int(max(0, np.floor(cy - pad)))
@@ -964,14 +1717,31 @@ def _add_soft_flare(layer, cx, cy, radius_px, peak, tail_len_px=0.0):
         return
     yy, xx = np.mgrid[y0:y1, x0:x1]
     r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    falloff = np.exp(-(r ** 2) / (2.0 * sigma ** 2))
-    contrib = peak * falloff
-    if tail_len_px > 0:
-        tail = peak * (1.0 + (r / sigma) ** 2) ** -1.25
-        t = np.clip((r - 0.6 * tail_len_px) / (0.4 * tail_len_px), 0.0, 1.0)
-        tail = tail * (1.0 - t * t * (3.0 - 2.0 * t))
-        contrib = np.maximum(contrib, tail)
-    layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
+    core = max(core_px, 0.5)
+    # smooth end over the outer 45% of the reach - reaches exactly 0 at
+    # reach_px, so no square box edge and never past the spike tips
+    t = np.clip((r - 0.55 * reach_px) / (0.45 * reach_px), 0.0, 1.0)
+    end = 1.0 - t * t * (3.0 - 2.0 * t)
+    glow = (1.0 + (r / core) ** 2) ** -0.7 * end
+    contrib = peak * glow
+    if rays > 0:
+        a = min(1.0, rays / 100.0)
+        table, bands = _flare_ray_table(n_spikes, rotation_deg, symmetry, seed, reach_px, fwhm_px)
+        theta = np.degrees(np.arctan2(yy - cy, xx - cx))
+        field = _flare_ray_field(r, theta, table, bands)
+        # Rays emerge at the core edge and fade with a slower power law
+        # than the glow, so they're what's visible across the whole band.
+        rise = np.clip((r - 0.6 * core) / (0.8 * core), 0.0, 1.0)
+        rise = rise * rise * (3.0 - 2.0 * rise)
+        span = max(0.5 * (reach_px - core), 1e-3)
+        ray_profile = rise * (1.0 + np.maximum(r - core, 0.0) / span) ** -1.0 * end
+        # Part of the glow's light goes into the rays (the same scattered
+        # light, structured), the rest stays a smooth halo underneath.
+        contrib = _soft_knee(contrib * (1.0 - 0.6 * a) + a * peak * field * ray_profile)
+    r_mult, g_mult, b_mult = color_mult
+    layer[y0:y1, x0:x1, 0] = np.maximum(layer[y0:y1, x0:x1, 0], contrib * r_mult)
+    layer[y0:y1, x0:x1, 1] = np.maximum(layer[y0:y1, x0:x1, 1], contrib * g_mult)
+    layer[y0:y1, x0:x1, 2] = np.maximum(layer[y0:y1, x0:x1, 2], contrib * b_mult)
 
 
 def ring_width_for_radius(ring_radius_px, fwhm_px):
@@ -985,10 +1755,13 @@ def ring_width_for_radius(ring_radius_px, fwhm_px):
     return max(0.8, ring_radius_px * 0.55, fwhm_px * 0.15)
 
 
-def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak):
+def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak,
+                     color_mult=(1.0, 1.0, 1.0)):
     """A soft brightening around the star at roughly this radius, blended
     into the surrounding glow rather than a crisp separate ring - see
-    ring_width_for_radius for why the width scales the way it does."""
+    ring_width_for_radius for why the width scales the way it does.
+    color_mult, as in _add_soft_flare, tints it toward the star's colour;
+    (1,1,1) (the default) keeps the original pure-white ring bit for bit."""
     if ring_radius_px < 1.0 or peak <= 0:
         return
     h, w, _ = layer.shape
@@ -1009,11 +1782,24 @@ def _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, peak):
     d = r - ring_radius_px
     falloff = np.exp(-(d ** 2) / (2.0 * ring_width_px ** 2))
     contrib = peak * falloff
-    layer[y0:y1, x0:x1, :] = np.maximum(layer[y0:y1, x0:x1, :], contrib[..., None])
+    r_mult, g_mult, b_mult = color_mult
+    layer[y0:y1, x0:x1, 0] = np.maximum(layer[y0:y1, x0:x1, 0], contrib * r_mult)
+    layer[y0:y1, x0:x1, 1] = np.maximum(layer[y0:y1, x0:x1, 1], contrib * g_mult)
+    layer[y0:y1, x0:x1, 2] = np.maximum(layer[y0:y1, x0:x1, 2], contrib * b_mult)
 
 
-_ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare", "flare_tail",
-                      "ring_flare", "chroma", "rainbow", "saturation")
+# Geometry (where the flares sit), not strength: these keep their dialled-
+# in value across Simple mode's size ramp and Small/Medium's narrower
+# slider ceilings (SPIKE_ANCHOR_LOOK_SCALE) - ramping a flare's reach from
+# 0 at the minimum diameter collapsed mid-size stars' flares into their
+# own core. Their fallback values when a dict doesn't have them:
+_SPIKE_GEOMETRY_KEYS = ("flare_reach", "ring_diam")
+SPIKE_FLARE_REACH_DEFAULT = 45.0   # % of the spike length
+SPIKE_RING_DIAM_DEFAULT = 1.6      # x star diameter - just past the star's edge
+
+_ANCHOR_PARAM_KEYS = ("length", "intensity", "thickness", "soft_flare", "flare_reach",
+                      "flare_rays", "ring_flare", "ring_diam",
+                      "flare_saturation", "rainbow", "saturation")
 
 # "Twinkle" look for a star below the Minimum diameter/Small anchor (see
 # SPIKE_DEFAULTS["twinkle"]): deliberately weaker than any real anchor's own
@@ -1024,7 +1810,6 @@ TWINKLE_LENGTH_MULT = 2.5        # x star diameter - long enough to clear the
                                   # swallowed by the core's own bright disc)
 TWINKLE_INTENSITY_SCALE = 1.0    # intensity = twinkle slider (0-100) * this
 TWINKLE_THICKNESS = 0.5
-
 
 def _smoothstep(t):
     t = max(0.0, min(1.0, t))
@@ -1068,8 +1853,9 @@ def _star_jitter_pair(x, y):
     Python versions/processes and doesn't need a RandomState object per
     star). The same star always jitters the same way across re-renders,
     zoom levels and Fit/Process, but neighbouring stars don't move in
-    lockstep - used by the "Natural variation" control to break up the
-    stamped/CGI look of many identical-size stars."""
+    lockstep - used by the "Natural variation" control (length only, not
+    rotation - see render_spike_layer) to break up the stamped/CGI look of
+    many identical-size stars."""
     h = (int(x * 97) * 374761393 + int(y * 97) * 668265263) & 0xffffffff
     h = (h ^ (h >> 13)) * 1274126177 & 0xffffffff
     h ^= h >> 16
@@ -1089,18 +1875,19 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
     normalized (r,g,b); forced=True bypasses the smallest anchor's diameter
     cutoff (used for stars the user explicitly turned on with Ctrl+Click
     even though they're smaller than that anchor); override, if not None,
-    is a dict of the 8 _ANCHOR_PARAM_KEYS set by Shift+Click-editing that
+    is a dict of the _ANCHOR_PARAM_KEYS set by Shift+Click-editing that
     one star individually (see App._spike_star_overrides) - used exactly
     as given instead of interpolating from cfg's anchors, and (like forced)
     bypasses the diameter cutoff, since dialling in a custom look for a
     star is itself a clear signal it should have a spike.
 
     cfg is a dict (see App._spike_config): "anchors" is the size-anchor
-    dicts (each with "diam" plus the 8 keys in _ANCHOR_PARAM_KEYS) that get
+    dicts (each with "diam" plus the keys in _ANCHOR_PARAM_KEYS) that get
     interpolated per star by _interp_anchor_params; "rays", "rotation",
     "hue" and "sharpness" (0-100, default 100 = untouched - softens the
     whole effect for long focal lengths/average seeing) apply globally;
-    "variation" (0-100) drives the per-star length/rotation jitter."""
+    "variation" (0-100) drives the per-star length jitter (not rotation -
+    see the note above the jitter/angles computation below)."""
     out_h, out_w = out_shape
     layer = np.zeros((out_h, out_w, 3), dtype=np.float32)
     if not stars or view_w <= 0:
@@ -1121,8 +1908,13 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
     hue = cfg["hue"]
     sharpness = cfg.get("sharpness", 100.0)
     jitter_amt = max(0.0, min(100.0, cfg.get("variation", 0.0))) / 100.0
+    flare_symmetry = max(0.0, min(100.0, cfg.get("flare_symmetry",
+                                                  SPIKE_DEFAULTS["flare_symmetry"]))) / 100.0
 
     scale = out_w / float(view_w)
+    # Same for every star (see SPIKE_DEFAULTS' "rainbow_period"), in the
+    # layer's own px.
+    rainbow_period_px = max(0.0, cfg.get("rainbow_period", SPIKE_DEFAULTS["rainbow_period"])) * scale
     max_amp = max((a for (_, _, _, a, _c, _f, _o) in stars), default=1.0) or 1.0
 
     for (x, y, fwhm, amp, color, forced, override) in stars:
@@ -1133,8 +1925,10 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
                 continue
             # A tiny fixed hint instead of nothing - see TWINKLE_* above.
             p = {"length": TWINKLE_LENGTH_MULT, "intensity": twinkle * TWINKLE_INTENSITY_SCALE,
-                 "thickness": TWINKLE_THICKNESS, "soft_flare": 0.0, "flare_tail": 0.0,
-                 "ring_flare": 0.0, "chroma": 0.0, "rainbow": 0.0, "saturation": 100.0}
+                 "thickness": TWINKLE_THICKNESS, "soft_flare": 0.0,
+                 "flare_reach": SPIKE_FLARE_REACH_DEFAULT, "flare_rays": 0.0, "ring_flare": 0.0,
+                 "ring_diam": SPIKE_RING_DIAM_DEFAULT, "flare_saturation": 0.0,
+                 "rainbow": 0.0, "saturation": 100.0}
         else:
             # Forced stars smaller than the smallest anchor use that
             # anchor's look exactly (clamped), never an extrapolation past
@@ -1155,11 +1949,14 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
         # clearly visible, only the very faintest ones are noticeably dimmer.
         rel_amp = 0.55 + 0.45 * min(1.0, max(0.0, amp / max_amp))
 
-        jx, jr = _star_jitter_pair(x, y)
+        # Rotation is NOT jittered per star: a real diffraction spike's
+        # angle comes from the telescope's own spider-vane orientation, the
+        # same physical hardware for every star in the frame - it can't
+        # vary from star to star within one photo, only Length legitimately
+        # does (seeing/PSF variation).
+        jx, _jr = _star_jitter_pair(x, y)
         length_jitter = 1.0 + jx * jitter_amt * 0.12  # up to +-12% length
-        rot_jitter_deg = jr * jitter_amt * 4.0          # up to +-4 degrees
-        angles = [rotation_deg + rot_jitter_deg + i * (360.0 / num_rays)
-                  for i in range(num_rays)]
+        angles = [rotation_deg + i * (360.0 / num_rays) for i in range(num_rays)]
 
         # Computed unconditionally (not just when intensity>0) because
         # soft_flare/ring_flare below both reference it too, to keep their
@@ -1178,39 +1975,64 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
                 # is what makes Fit, 100% zoom and the final Process match.
                 th_px = max(0.05, p["thickness"] * scale)
                 peak = (p["intensity"] / 100.0) * rel_amp
-                for ang in angles:
+                for i, ang in enumerate(angles):
                     _add_spike_ray(layer, cx, cy, ang, ray_len_px, th_px, peak,
-                                    star_color, p["chroma"], p["rainbow"], p["saturation"])
+                                    star_color, p["rainbow"], p["saturation"],
+                                    period_px=rainbow_period_px, px_scale=scale,
+                                    flicker_seed=(x * 7.13 + y * 3.71 + i * 101.0) % 10007.0,
+                                    flicker=SPIKE_FLICKER)
+
+        if p["soft_flare"] > 0 or p["ring_flare"] > 0:
+            # Soft flare and ring flare share one saturation
+            # control (see SPIKE_ANCHOR_PARAM_DEFS' "flare_saturation")
+            # rather than a separate knob each - they're all the same
+            # scattered/diffracted starlight, so they'd always be tinted
+            # together anyway. Reuses _spike_color_mult's own blend so 0
+            # means the same pure white as before this control existed.
+            flare_color_mult = _spike_color_mult(star_color, p.get("flare_saturation", 0.0))
+        else:
+            flare_color_mult = (1.0, 1.0, 1.0)
+
+        # Both flares live in a band from the star's own visible edge
+        # (core_px) out to a reach set as a fraction of the rendered spike
+        # length - never past the spike tips (a flare poking out beyond the
+        # spikes reads as a separate, oversized disc), and never so short
+        # that it disappears inside the star's own core (the reach is
+        # floored at core_px + 1.5 star diameters).
+        core_px = 0.5 * fwhm * scale
+        min_reach_px = core_px + 1.5 * fwhm * scale
+        max_reach_px = max(ray_len_px, min_reach_px)
 
         if p["soft_flare"] > 0:
-            # A real stellar halo/bloom (scattered light, sensor blooming)
-            # is broader than the tight diffraction ring below and can
-            # bleed a little past the spikes' own tips, so this cap is
-            # generous rather than tight - it only kicks in for a
-            # dramatically short Length, not a normal one.
-            flare_radius_px = min(fwhm * 4.0 * scale,
-                                   max(ray_len_px * 1.2, fwhm * 2.0 * scale))
-            if flare_radius_px >= 1.0:
+            reach_frac = p.get("flare_reach", SPIKE_FLARE_REACH_DEFAULT) / 100.0
+            reach_px = min(max_reach_px, max(min_reach_px, reach_frac * ray_len_px))
+            if reach_px >= 1.0:
                 flare_peak = (p["soft_flare"] / 100.0) * rel_amp * 0.8
-                _add_soft_flare(layer, cx, cy, flare_radius_px, flare_peak,
-                                p.get("flare_tail", 0.0) * fwhm * scale)
+                # Seeded by the star's position so its sunburst is its own
+                # but never changes between re-renders/zoom levels.
+                seed = [int(x * 97) & 0xffffffff, int(y * 97) & 0xffffffff]
+                _add_soft_flare(layer, cx, cy, core_px, reach_px, flare_peak,
+                                flare_color_mult,
+                                rays=p.get("flare_rays", 0.0), n_spikes=num_rays,
+                                rotation_deg=rotation_deg, symmetry=flare_symmetry,
+                                seed=seed, fwhm_px=fwhm * scale)
 
         if p["ring_flare"] > 0:
-            # A real diffraction ring comes from the aperture itself (a
-            # different mechanism than the support-vane spikes) and sits
-            # close to the star - on the order of its own FWHM, not the
-            # spike length. A radius fixed at fwhm alone looked fine next
-            # to a long spike but read as a separate ring floating well
-            # past a short one, so this caps it at a modest fraction of the
-            # actual rendered ray length too - while never shrinking below
-            # roughly the star's own size, since the ring exists even when
-            # spikes are short or disabled.
-            ring_radius_px = min(fwhm * 1.8 * scale,
-                                  max(ray_len_px * 0.6, fwhm * 1.0 * scale))
+            # A diffraction ring hugs the star (a real Airy ring sits just
+            # outside the core), so its size is its own DIAMETER in star
+            # diameters - 1.6x (the default) sits just past the star's own
+            # edge - kept outside the core and inside the spikes.
+            ring_diam = p.get("ring_diam", SPIKE_RING_DIAM_DEFAULT)
+            ring_radius_px = max(core_px * 1.15, 0.5 * ring_diam * fwhm * scale)
+            # (its soft width is ~0.55x its radius - see
+            # ring_width_for_radius - so 0.42x the spike length keeps even
+            # its outer shoulder inside the spike tips)
+            ring_radius_px = min(ring_radius_px, max(0.42 * ray_len_px, core_px * 1.15))
             ring_width_px = ring_width_for_radius(ring_radius_px, fwhm * scale)
             if ring_radius_px >= 1.5:
                 ring_peak = (p["ring_flare"] / 100.0) * rel_amp * 0.7
-                _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, ring_peak)
+                _add_ring_flare(layer, cx, cy, ring_radius_px, ring_width_px, ring_peak,
+                                 flare_color_mult)
 
                 # A real Airy pattern isn't one ring - successive bright
                 # rings sit at roughly 1.8x the radius of the one before
@@ -1219,15 +2041,14 @@ def render_spike_layer(out_shape, view_x0, view_y0, view_w, view_h, stars, cfg):
                 # previous ring's peak. A single, suspiciously clean circle
                 # reads as synthetic; this second, fainter, wider one is
                 # what makes it read as a real multi-ring diffraction
-                # pattern instead - only drawn once the first ring is
-                # already visible, and capped against the same rendered
-                # ray length for the same reason as the first.
+                # pattern instead - also kept inside the spikes.
+                ring2_width_px = ring_width_px * 1.3
                 ring2_radius_px = min(ring_radius_px * 1.8,
-                                       max(ray_len_px * 0.9, fwhm * 1.4 * scale))
-                if ring2_radius_px >= 1.5:
-                    ring2_width_px = ring_width_px * 1.3
+                                       max(ray_len_px - 3.0 * ring2_width_px, 0.0))
+                if ring2_radius_px > ring_radius_px * 1.2:
                     ring2_peak = ring_peak * 0.25
-                    _add_ring_flare(layer, cx, cy, ring2_radius_px, ring2_width_px, ring2_peak)
+                    _add_ring_flare(layer, cx, cy, ring2_radius_px, ring2_width_px, ring2_peak,
+                                     flare_color_mult)
 
     if sharpness < 100.0:
         # Expressed in full-res pixels then scaled, same convention as
@@ -1251,6 +2072,8 @@ def apply_spikes(rgb, layer):
 
 class SirilWorker:
     """Holds the connection to Siril and serializes all calls on a single thread."""
+
+    standalone = False  # see FileWorker - App branches on this, not isinstance()
 
     def __init__(self):
         self.siril = s.SirilInterface()
@@ -1287,6 +2110,17 @@ class SirilWorker:
             return name or "(unnamed)"
         except Exception:
             return "(unnamed)"
+
+    def get_focal_length(self):
+        """The telescope's focal length in mm, from the FITS header Siril
+        already parsed for this image - None if missing/zero (an unusual
+        but real case: not every FITS file carries this keyword) or on any
+        error, so the caller can fall back to the hand-tuned defaults."""
+        try:
+            fl = float(self.siril.get_image_keywords().focal_length)
+            return fl if fl > 0 else None
+        except Exception:
+            return None
 
     def _findstar_raw(self, maxstars=2000):
         """One findstar + get_image_stars round-trip over whatever is
@@ -1435,6 +2269,110 @@ class SirilWorker:
             self.siril.set_image_pixeldata(chw)
 
 
+class FileWorker:
+    """Standalone (no Siril) mode: same interface as SirilWorker (duck-typed
+    - App only ever calls through self.worker, never checks which class it
+    is, except via the `standalone` flag), but reads/writes FITS or TIFF
+    files directly instead of talking to a running Siril instance, and uses
+    photutils in place of Siril's own 'findstar'.
+
+    Follows SirilWorker's exact raw/display convention split so the rest of
+    the app (particularly App._reload_thread, which converts stars raw<->
+    display around the pixel-level saturated-star/colour-sampling steps -
+    see the comment there) needs no changes at all: fetch_full() returns
+    pixel data in "raw" order (row 0 = bottom - FITS' own native order;
+    _load_tiff/_load_fits normalize either source format to this), while
+    get_stars() returns star y in "display" order (row 0 = top), exactly
+    like Siril's own get_image_stars()."""
+
+    standalone = True
+
+    def __init__(self):
+        self.path = None
+        self._raw_rgb = None    # (H,W,3) float01, raw (row 0 = bottom) order
+        self._shape = None      # (h, w)
+        self._src_ext = None    # source file extension, used to pick a Save As default
+        self._focal_length = None  # mm, from the FITS header - None if unavailable (e.g. TIFF)
+        self.last_rgb = None    # most recent Process() result, display order - cached
+        # for File > Save As (re-saving without recomputing) since App.push_rgb
+        # can't itself open a file dialog (called from a background thread).
+
+    def cmd(self, *args):
+        pass  # no Siril command channel in standalone mode
+
+    def log(self, msg):
+        print(msg)
+
+    def get_wd(self):
+        return os.path.dirname(self.path) if self.path else os.path.expanduser("~")
+
+    def get_shape(self):
+        return self._shape
+
+    def is_image_loaded(self):
+        return self._raw_rgb is not None
+
+    def get_active_filename(self):
+        return os.path.basename(self.path) if self.path else "(none)"
+
+    def open_path(self, path):
+        """Loads a .fits/.fit/.fts or .tif/.tiff file - raises on failure
+        (an unsupported extension, a missing optional dependency, or a file
+        the library itself can't parse), left to the caller (App._on_open_file,
+        on the main thread) to report via a message box."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".fit", ".fits", ".fts"):
+            arr = _load_fits(path)
+        elif ext in (".tif", ".tiff"):
+            arr = _load_tiff(path)
+        else:
+            raise ValueError(f"Unsupported file type {ext!r} - expected "
+                              f".fits/.fit/.fts or .tif/.tiff")
+        self.path = path
+        self._raw_rgb = arr
+        self._shape = arr.shape[:2]
+        self._src_ext = ext
+        self._focal_length = _read_fits_focal_length(path) if ext in (".fit", ".fits", ".fts") else None
+
+    def get_focal_length(self):
+        return self._focal_length
+
+    def get_stars(self):
+        h, _w = self._shape
+        raw_stars = _detect_stars_standalone(self._raw_rgb)
+        return [(x, h - 1.0 - y, fwhm, amp) for (x, y, fwhm, amp) in raw_stars]
+
+    def clear_stars(self):
+        pass  # no on-image star markers to clear outside Siril
+
+    def fetch_full(self):
+        return self._raw_rgb
+
+    def push_rgb(self, rgb_float01):
+        """No live image to overwrite in standalone mode - just cache the
+        result (display order, same as SirilWorker.push_rgb receives) for
+        App to save to disk once the user picks a path."""
+        self.last_rgb = np.clip(rgb_float01, 0.0, 1.0).astype(np.float32)
+
+    def save_rgb(self, rgb_float01, path, bit_depth=None):
+        """Writes rgb_float01 (display order, row 0 = top) to `path` as
+        FITS or TIFF, picked by its extension. bit_depth defaults to 32
+        (float) for FITS - the standard lossless astro interchange depth -
+        and 16 (unsigned) for TIFF, unless the source file's own depth
+        suggests otherwise isn't needed here since the caller (App) always
+        passes an explicit choice from its Save As dialog."""
+        ext = os.path.splitext(path)[1].lower()
+        if bit_depth is None:
+            bit_depth = 32 if ext in (".fit", ".fits", ".fts") else 16
+        if ext in (".fit", ".fits", ".fts"):
+            _save_fits(path, rgb_float01, bit_depth)
+        elif ext in (".tif", ".tiff"):
+            _save_tiff(path, rgb_float01, bit_depth)
+        else:
+            raise ValueError(f"Unsupported file type {ext!r} - expected "
+                              f".fits/.fit/.fts or .tif/.tiff")
+
+
 class App:
     def __init__(self, root, worker: SirilWorker):
         self.root = root
@@ -1443,26 +2381,30 @@ class App:
 
         self.workdir = tk.StringVar(value=self.worker.get_wd())
         self.active_filename = tk.StringVar(value="(none)")
-        self.status = tk.StringVar(value="Reading the active image from Siril...")
+        self.status = tk.StringVar(
+            value="Open an image to get started (File > Open...)." if worker.standalone
+            else "Reading the active image from Siril...")
 
-        self.exposure = tk.DoubleVar(value=0)
-        self.contrast = tk.DoubleVar(value=0)
-        self.blacks = tk.DoubleVar(value=0)
-        self.highlights = tk.DoubleVar(value=0)
-        self.clarity = tk.DoubleVar(value=0)
-        self.vibrance = tk.DoubleVar(value=0)
-        self.saturation = tk.DoubleVar(value=0)
-        self.temperature = tk.DoubleVar(value=0)
-        self.tint = tk.DoubleVar(value=0)
-        self.exposure_label = tk.StringVar(value="0")
-        self.contrast_label = tk.StringVar(value="0")
-        self.blacks_label = tk.StringVar(value="0")
-        self.highlights_label = tk.StringVar(value="0")
-        self.clarity_label = tk.StringVar(value="0")
-        self.vibrance_label = tk.StringVar(value="0")
-        self.saturation_label = tk.StringVar(value="0")
-        self.temperature_label = tk.StringVar(value="0")
-        self.tint_label = tk.StringVar(value="0")
+        if worker.standalone:
+            menubar = tk.Menu(root)
+            file_menu = tk.Menu(menubar, tearoff=False)
+            file_menu.add_command(label="Open...", accelerator="Ctrl+O",
+                                    command=self._on_open_file)
+            file_menu.add_command(label="Save As...", accelerator="Ctrl+S",
+                                    command=self._on_save_as_menu)
+            menubar.add_cascade(label="File", menu=file_menu)
+            root.config(menu=menubar)
+            root.bind("<Control-o>", lambda _e: self._on_open_file())
+            root.bind("<Control-s>", lambda _e: self._on_save_as_menu())
+
+        # One dict for every left-panel (Base/Detail/...) tone/color
+        # control, keyed by TONE_PARAM_DEFS' own keys plus "<key>_label" -
+        # same shape/pattern as self.spike_uniform, built in a loop instead
+        # of one hand-written Var pair per parameter.
+        self.tone = {}
+        for key, _label, _lo, _hi, _step, fmt in TONE_PARAM_DEFS:
+            self.tone[key] = tk.DoubleVar(value=TONE_DEFAULTS[key])
+            self.tone[key + "_label"] = tk.StringVar(value=fmt.format(TONE_DEFAULTS[key]))
 
         d = SPIKE_DEFAULTS
         self.spike_enabled = tk.BooleanVar(value=d["enabled"])
@@ -1472,11 +2414,15 @@ class App:
         self.spike_sharpness = tk.DoubleVar(value=d["sharpness"])
         self.spike_variation = tk.DoubleVar(value=d["variation"])
         self.spike_twinkle = tk.DoubleVar(value=d["twinkle"])
+        self.spike_flare_symmetry = tk.DoubleVar(value=d["flare_symmetry"])
+        self.spike_rainbow_period = tk.DoubleVar(value=d["rainbow_period"])
         self.spike_rotation_label = tk.StringVar(value=f"{d['rotation']:.0f}")
         self.spike_hue_label = tk.StringVar(value=f"{d['hue']:.0f}")
         self.spike_sharpness_label = tk.StringVar(value=f"{d['sharpness']:.0f}")
         self.spike_variation_label = tk.StringVar(value=f"{d['variation']:.0f}")
         self.spike_twinkle_label = tk.StringVar(value=f"{d['twinkle']:.0f}")
+        self.spike_flare_symmetry_label = tk.StringVar(value=f"{d['flare_symmetry']:.0f}")
+        self.spike_rainbow_period_label = tk.StringVar(value=f"{d['rainbow_period']:.0f}")
 
         # One dict per size anchor (Small/Medium/Large), each holding a
         # tk.DoubleVar + tk.StringVar label per key in SPIKE_ANCHOR_PARAM_DEFS
@@ -1513,6 +2459,12 @@ class App:
             val = ud[key]
             self.spike_uniform[key] = tk.DoubleVar(value=val)
             self.spike_uniform[key + "_label"] = tk.StringVar(value=fmt.format(val))
+
+        # Open/closed state of the "Rays"/"Flare" collapsible sections (see
+        # _make_collapsible), keyed by a per-panel string so e.g. collapsing
+        # Small's Flare section doesn't affect Medium/Large or Simple mode.
+        # Persists for the rest of the session, not saved across restarts.
+        self._collapsible_state = {}
 
         # Detected stars as (xpos, ypos, fwhm, amplitude, color), full-res px;
         # color is the star's own normalized (r,g,b), see sample_star_color().
@@ -1740,31 +2692,21 @@ class App:
         ctrl_outer, frm_ctrl, self._ctrl_canvas = self._make_scrollable_frame(frm_main)
         ctrl_outer.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
 
-        frm_light = ttk.LabelFrame(frm_ctrl, text="Light & Tones")
-        frm_light.pack(fill="x", pady=(0, 10))
-        frm_light.grid_columnconfigure(0, minsize=230)
-        self._add_slider(frm_light, 0, "Exposure", self.exposure, self.exposure_label, -100, 100, step=1)
-        self._add_slider(frm_light, 2, "Contrast", self.contrast, self.contrast_label, -100, 100, step=1)
-        self._add_slider(frm_light, 4, "Blacks / Sky Background",
-                          self.blacks, self.blacks_label, -100, 100, step=1)
-        self._add_slider(frm_light, 6, "Highlights / Whites",
-                          self.highlights, self.highlights_label, -100, 100, step=1)
-        self._add_slider(frm_light, 8, "Clarity (local contrast)",
-                          self.clarity, self.clarity_label, -100, 100, step=1)
+        self._build_grouped_tone_sliders(frm_ctrl)
 
-        frm_color = ttk.LabelFrame(frm_ctrl, text="Color & Hue")
-        frm_color.pack(fill="x")
-        frm_color.grid_columnconfigure(0, minsize=230)
-        self._add_slider(frm_color, 0, "Vibrance",
-                          self.vibrance, self.vibrance_label, -100, 100, step=1)
-        self._add_slider(frm_color, 2, "Saturation",
-                          self.saturation, self.saturation_label, -100, 100, step=1)
-        self._add_slider(frm_color, 4, "Temperature (cool / warm)",
-                          self.temperature, self.temperature_label, -50, 50, step=0.5)
-        self._add_slider(frm_color, 6, "Tint (green / magenta)",
-                          self.tint, self.tint_label, -50, 50, step=0.5)
+        ttk.Button(frm_ctrl, text="✨ Magic Wand", style="Accent.TButton",
+                   command=self._on_magic_wand).pack(fill="x", pady=(14, 0))
+        ttk.Label(frm_ctrl, text="Auto-balances color/tone and sizes the default spikes "
+                                  "to this image's own focal length",
+                  style="Muted.TLabel", wraplength=210, justify="left").pack(
+            fill="x", pady=(2, 0))
 
-        self.btn_process = ttk.Button(frm_ctrl, text="Process and import in Siril",
+        ttk.Button(frm_ctrl, text="Reset", style="Warn.TButton",
+                   command=self._reset_tone_defaults).pack(fill="x", pady=(10, 0))
+
+        process_label = ("Process and Save As..." if self.worker.standalone
+                         else "Process and import in Siril")
+        self.btn_process = ttk.Button(frm_ctrl, text=process_label,
                                        style="Accent.TButton",
                                        command=self._on_process, state="disabled")
         self.btn_process.pack(fill="x", pady=(18, 0))
@@ -1790,6 +2732,9 @@ class App:
         ttk.Checkbutton(frm_toolbar, text="Hide background (spikes only)",
                          variable=self.hide_background,
                          command=self._on_hide_background_toggle).pack(side="left", padx=(16, 0))
+        ttk.Label(frm_toolbar, text="Hold Space: original, as imported from Siril — "
+                                     "release: your edits",
+                  style="CardMuted.TLabel").pack(side="left", padx=(16, 0))
         ttk.Label(frm_toolbar, text="Fit: fast low-res preview — 100%/+/-: real full-resolution"
                                      " crop (drag, scroll wheel, or the scrollbars to pan)",
                   style="CardMuted.TLabel").pack(side="left", padx=(16, 0))
@@ -1849,90 +2794,114 @@ class App:
                          value="per_size", variable=self.spike_mode,
                          command=self._on_spike_mode_change).pack(anchor="w")
 
-        ttk.Label(frm_spikes, text="Number of rays", style="Card.TLabel").grid(
+        # ---- General: every global (not per-size-anchor) control, in one
+        # collapsible section rather than scattered loose sliders - Number
+        # of rays, Rotation, Color hue, Sharpness, Natural variation,
+        # Twinkle, Rainbow segment spacing, plus Minimum star diameter (Simple mode
+        # only). Minimum star diameter still leads the section - which
+        # stars get a spike at all is the most fundamental choice - shown/
+        # hidden by _update_spike_mode_ui alongside the notebook/uniform/
+        # star panels below, independently of this section's own collapsed
+        # state. ----
+        general_content = self._make_collapsible(frm_spikes, 2, "General", "general")
+
+        self._spike_min_diam_frame = ttk.Frame(general_content, style="Card.TFrame")
+        self._spike_min_diam_frame.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self._spike_min_diam_frame.grid_columnconfigure(0, minsize=200)
+        u_lo, u_hi = SPIKE_ANCHOR_DIAM_RANGES[0]
+        self._add_slider(self._spike_min_diam_frame, 0, "Minimum star diameter (px)",
+                          self.spike_uniform_min_diam, self.spike_uniform_min_diam_label,
+                          u_lo, u_hi, step=1, on_change=self._on_spike_slider)
+
+        ttk.Label(general_content, text="Number of rays", style="Card.TLabel").grid(
             row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 0))
-        rays_box = ttk.Frame(frm_spikes, style="Card.TFrame")
+        rays_box = ttk.Frame(general_content, style="Card.TFrame")
         rays_box.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
         ttk.Radiobutton(rays_box, text="4 (refractor / 2-vane spider)", value=4,
                          variable=self.spike_rays, command=self._on_spike_slider).pack(anchor="w")
         ttk.Radiobutton(rays_box, text="6 (3-vane spider, e.g. Newtonian)", value=6,
                          variable=self.spike_rays, command=self._on_spike_slider).pack(anchor="w")
 
-        self._add_slider(frm_spikes, 4, "Rotation angle (0-90 deg)",
+        self._add_slider(general_content, 4, "Rotation angle (0-90 deg)",
                           self.spike_rotation, self.spike_rotation_label, 0, 90,
                           step=1, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 6, "Color hue (each spike keeps its star's colour)",
+        self._add_slider(general_content, 6, "Color hue (each spike keeps its star's colour)",
                           self.spike_hue, self.spike_hue_label, -180, 180,
                           step=5, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 8, "Sharpness (lower = softer, for long focal lengths)",
+        self._add_slider(general_content, 8, "Sharpness (lower = softer, for long focal lengths)",
                           self.spike_sharpness, self.spike_sharpness_label, 0, 100,
                           step=5, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 10, "Natural variation (per-star jitter)",
+        self._add_slider(general_content, 10, "Natural variation (per-star length jitter)",
                           self.spike_variation, self.spike_variation_label, 0, 100,
                           step=5, on_change=self._on_spike_slider)
-        self._add_slider(frm_spikes, 12, "Twinkle (a tiny hint of spike below the minimum diameter)",
+        self._add_slider(general_content, 12, "Twinkle (a tiny hint of spike below the minimum diameter)",
                           self.spike_twinkle, self.spike_twinkle_label, 0, 100,
                           step=5, on_change=self._on_spike_slider)
+        # Global, not per size: the diffraction rainbow's segment spacing
+        # comes from the optics (see SPIKE_DEFAULTS' "rainbow_period"), so
+        # it's the same for every star - each size's own "Diffraction
+        # rainbow" slider only sets how strongly it shows.
+        self._add_slider(general_content, 14, "Rainbow segment spacing (px)",
+                          self.spike_rainbow_period, self.spike_rainbow_period_label, 5, 200,
+                          step=1, on_change=self._on_spike_slider)
+        # "Flare ray symmetry" lives in each panel's Flare section instead
+        # (see _build_grouped_anchor_sliders) - it's about the flare, even
+        # though (like Number of rays above) it's a single global value,
+        # not a per-size one.
 
-        # ---- Per-size-anchor look: a tab per anchor, each with the full
-        # set of size-dependent controls, generated from SPIKE_ANCHOR_PARAM_DEFS
-        # so this stays one loop instead of ~30 hand-written slider calls. ----
+        # ---- Per-size-anchor look: a tab per anchor, each with "diam"
+        # (which star size this tab applies to) followed by the Rays/Flare
+        # collapsible sections - see _build_grouped_anchor_sliders, which
+        # keeps this, the Uniform panel below and the per-star panel
+        # further down in sync by construction. ----
         self._spike_notebook = ttk.Notebook(frm_spikes)
-        self._spike_notebook.grid(row=14, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_notebook.grid(row=18, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        diam_label, _lo, _hi, diam_step, _fmt = _SPIKE_PARAM_DEFS_BY_KEY["diam"]
         for tab_index, (tab_label, anchor_vars) in enumerate(
                 zip(SPIKE_ANCHOR_TAB_LABELS, self.spike_anchors)):
             tab = ttk.Frame(self._spike_notebook, style="Card.TFrame")
             tab.grid_columnconfigure(0, minsize=200)
             self._spike_notebook.add(tab, text=tab_label)
-            r = 0
-            for key, label, _lo, _hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
-                lo, hi = spike_anchor_slider_range(tab_index, key)
-                self._add_slider(tab, r, label, anchor_vars[key], anchor_vars[key + "_label"],
-                                  lo, hi, step=step, on_change=self._on_spike_slider)
-                r += 2
+            diam_lo, diam_hi = spike_anchor_slider_range(tab_index, "diam")
+            self._add_slider(tab, 0, diam_label, anchor_vars["diam"],
+                              anchor_vars["diam_label"], diam_lo, diam_hi,
+                              step=diam_step, on_change=self._on_spike_slider)
+            self._build_grouped_anchor_sliders(tab, anchor_vars, self._on_spike_slider,
+                                                 tab_index=tab_index, key_prefix=f"tab{tab_index}_")
 
-        # ---- Uniform look: the same 8 size-dependent controls as one tab
-        # would have, plus the cutoff diameter, gridded in the same cell as
-        # the notebook above - only one of the two is ever shown. ----
+        # ---- Uniform look: the same Rays/Flare sections as one tab would
+        # have (the cutoff diameter itself lives above, in
+        # _spike_min_diam_frame - see the note there), gridded in the same
+        # cell as the notebook above - only one of the two is ever shown. ----
         self._spike_uniform_frame = ttk.Frame(frm_spikes, style="Card.TFrame")
-        self._spike_uniform_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_uniform_frame.grid(row=18, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
         self._spike_uniform_frame.grid_columnconfigure(0, minsize=200)
-        u_lo, u_hi = SPIKE_ANCHOR_DIAM_RANGES[0]
-        self._add_slider(self._spike_uniform_frame, 0, "Minimum star diameter (px)",
-                          self.spike_uniform_min_diam, self.spike_uniform_min_diam_label,
-                          u_lo, u_hi, step=1, on_change=self._on_spike_slider)
-        r = 2
-        for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
-            if key == "diam":
-                continue
-            self._add_slider(self._spike_uniform_frame, r, label, self.spike_uniform[key],
-                              self.spike_uniform[key + "_label"], lo, hi, step=step,
-                              on_change=self._on_spike_slider)
-            r += 2
+        self._build_grouped_anchor_sliders(self._spike_uniform_frame, self.spike_uniform,
+                                             self._on_spike_slider, key_prefix="uniform_")
 
         # ---- Single-star editing: shown instead of the notebook/uniform
-        # panel above whenever a star is Shift+Click-selected - same 8
+        # panel above whenever a star is Shift+Click-selected - same
         # sliders, but they read/write that one star's own override. ----
         self._spike_star_frame = ttk.Frame(frm_spikes, style="Card.TFrame")
-        self._spike_star_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
+        self._spike_star_frame.grid(row=18, column=0, columnspan=3, sticky="ew", padx=8, pady=(10, 4))
         self._spike_star_frame.grid_columnconfigure(0, minsize=200)
         ttk.Label(self._spike_star_frame, textvariable=self.spike_star_info,
                   style="Card.TLabel", justify="left", wraplength=210).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 4))
-        r = 2
-        for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
-            if key == "diam":
-                continue
-            self._add_slider(self._spike_star_frame, r, label, self.spike_star[key],
-                              self.spike_star[key + "_label"], lo, hi, step=step,
-                              on_change=self._on_star_slider_change)
-            r += 2
+        star_frame = ttk.Frame(self._spike_star_frame, style="Card.TFrame")
+        star_frame.grid_columnconfigure(0, minsize=200)
+        star_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._build_grouped_anchor_sliders(star_frame, self.spike_star,
+                                             self._on_star_slider_change, key_prefix="star_")
+        # star_frame occupies exactly row 1 of _spike_star_frame's own grid
+        # regardless of its internal (collapsible-section) row count, so
+        # the buttons below it just need the next two rows, not that count.
         ttk.Button(self._spike_star_frame, text="Reset this star to its size-based look",
                    style="Warn.TButton", command=self._reset_selected_star_override).grid(
-            row=r, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 2))
+            row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 2))
         ttk.Button(self._spike_star_frame, text="Deselect", style="Toolbar.TButton",
                    command=self._deselect_star).grid(
-            row=r + 1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
+            row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
 
         self._spike_help_per_size = ("Each star's own diameter blends smoothly between the\n"
                        "Small/Medium/Large tabs above - stars below the Small\n"
@@ -1954,13 +2923,13 @@ class App:
                        "or empty space / Deselect to stop editing a single star.")
         self._spike_help_label = ttk.Label(frm_spikes, style="CardMuted.TLabel", justify="left")
         self._spike_help_label.grid(
-            row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+            row=19, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
         ttk.Button(frm_spikes, text="Reset manual edits", style="Danger.TButton",
                    command=self._reset_spike_edits).grid(
-            row=16, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
+            row=20, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 4))
         ttk.Button(frm_spikes, text="Defaults", style="Warn.TButton",
                    command=self._reset_spike_defaults).grid(
-            row=17, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+            row=21, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
         self._update_spike_mode_ui()
 
         # ---- Status bar ----
@@ -2014,6 +2983,175 @@ class App:
         ttk.Button(spin, text="▼", style="Spin.TButton", width=2,
                    command=lambda: _bump(-step)).pack(side="top", fill="x")
 
+    def _make_collapsible(self, parent, row, title, state_key, use_pack=False):
+        """A titled section whose content (the returned frame - sliders go
+        in it, at their own locally-numbered rows starting from 0) can be
+        shown/hidden by clicking the header. `state_key` must be unique
+        across the whole app - open/closed state is remembered in
+        self._collapsible_state for the rest of the session (e.g.
+        collapsing "Flare" on the Small tab keeps it collapsed if you
+        switch to Medium, or back to Simple mode, without having to redo
+        it). By default header/content are gridded at `row`/`row+1` of
+        `parent`'s own grid; with use_pack=True (for a parent, like the
+        left tone panel's column, that stacks sections with pack() instead
+        of grid()) they're pack()ed at the bottom instead, and `row` is
+        ignored - sections must then be created in the order they should
+        appear."""
+        is_open = self._collapsible_state.get(state_key, True)
+        header = ttk.Frame(parent, style="Card.TFrame", cursor="hand2")
+        arrow_var = tk.StringVar(value="▾" if is_open else "▸")
+        arrow_lbl = ttk.Label(header, textvariable=arrow_var, style="Card.TLabel")
+        arrow_lbl.pack(side="left")
+        title_lbl = ttk.Label(header, text=title, style="CardHeading.TLabel")
+        title_lbl.pack(side="left", padx=(4, 0))
+        ttk.Separator(header, orient="horizontal").pack(side="left", fill="x",
+                                                          expand=True, padx=(8, 0))
+
+        content = ttk.Frame(parent, style="Card.TFrame")
+        content.grid_columnconfigure(0, minsize=200)
+
+        if use_pack:
+            header.pack(fill="x", padx=8, pady=(8, 0))
+            # after=header: pack() with no position option always appends
+            # at the end of the packing order, so re-showing a collapsed
+            # section after a later one was already packed would otherwise
+            # jump it to the bottom instead of back into place.
+            content.pack(fill="x", padx=8, pady=(2, 4), after=header)
+        else:
+            header.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 0))
+            content.grid(row=row + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 4))
+        if not is_open:
+            content.pack_forget() if use_pack else content.grid_remove()
+
+        def _toggle(_evt=None):
+            now_open = not self._collapsible_state.get(state_key, True)
+            self._collapsible_state[state_key] = now_open
+            arrow_var.set("▾" if now_open else "▸")
+            if use_pack:
+                if now_open:
+                    content.pack(fill="x", padx=8, pady=(2, 4), after=header)
+                else:
+                    content.pack_forget()
+            else:
+                if now_open:
+                    content.grid()
+                else:
+                    content.grid_remove()
+
+        for widget in (header, arrow_lbl, title_lbl):
+            widget.bind("<Button-1>", _toggle)
+        return content
+
+    def _build_grouped_anchor_sliders(self, parent, vars_dict, on_change,
+                                        tab_index=None, key_prefix=""):
+        """Fills `parent` with one collapsible section per SPIKE_PARAM_GROUPS
+        entry ("Rays", "Flare"), each holding that group's sliders from
+        SPIKE_ANCHOR_PARAM_DEFS (skipping "diam", which the caller places
+        separately - see the note on _SPIKE_PARAM_GROUP). Used identically
+        for a per-size tab, the Simple/Uniform panel and the per-star
+        override panel, so the three stay in sync by construction rather
+        than by hand-copying the same grouping three times. tab_index, if
+        not None, selects that tab's own narrower slider range (see
+        spike_anchor_slider_range) instead of each param's full range.
+        Returns the next free row in `parent`'s own grid, for whatever the
+        caller places below (e.g. the star panel's Reset/Deselect buttons)."""
+        r = 0
+        for group in SPIKE_PARAM_GROUPS:
+            content = self._make_collapsible(parent, r, SPIKE_PARAM_GROUP_TITLES[group],
+                                              f"{key_prefix}{group}")
+            r += 2
+            cr = 0
+            for key, label, lo, hi, step, _fmt in SPIKE_ANCHOR_PARAM_DEFS:
+                if key == "diam" or _SPIKE_PARAM_GROUP.get(key) != group:
+                    continue
+                if tab_index is not None:
+                    lo, hi = spike_anchor_slider_range(tab_index, key)
+                self._add_slider(content, cr, label, vars_dict[key],
+                                  vars_dict[key + "_label"], lo, hi, step=step,
+                                  on_change=on_change)
+                cr += 2
+            if group == "flare":
+                # A single global value (like "Number of rays" in General),
+                # not a per-size/per-star one - always bound to the same
+                # Var and always re-renders via _on_spike_slider, regardless
+                # of which panel (tab/Uniform/per-star) this Flare section
+                # belongs to, so it stays in sync everywhere it's shown.
+                self._add_slider(content, cr, "Flare ray symmetry (0 = irregular, 100 = repeats every spike)",
+                                  self.spike_flare_symmetry, self.spike_flare_symmetry_label,
+                                  0, 100, step=5, on_change=self._on_spike_slider)
+                cr += 2
+        return r
+
+    def _build_grouped_tone_sliders(self, parent):
+        """Fills `parent` (frm_ctrl, the left panel's own scrollable
+        column - pack()ed, not grid()ed, hence use_pack=True) with one
+        collapsible section per TONE_PARAM_GROUPS entry ("Base", "Dettaglio
+        e presenza"), each holding that group's sliders from
+        TONE_PARAM_DEFS. Same pattern as _build_grouped_anchor_sliders."""
+        for group in TONE_PARAM_GROUPS:
+            content = self._make_collapsible(parent, 0, TONE_PARAM_GROUP_TITLES[group],
+                                              f"tone_{group}", use_pack=True)
+            cr = 0
+            for key, label, lo, hi, step, _fmt in TONE_PARAM_DEFS:
+                if _TONE_PARAM_GROUP.get(key) != group:
+                    continue
+                self._add_slider(content, cr, label, self.tone[key],
+                                  self.tone[key + "_label"], lo, hi, step=step,
+                                  on_change=self._on_tone_slider)
+                cr += 2
+
+    # ---------- Standalone mode: Open/Save (main thread - file dialogs
+    # can't be opened from a background thread) ----------
+    def _on_open_file(self):
+        path = filedialog.askopenfilename(
+            title="Open image",
+            filetypes=[("FITS/TIFF images", "*.fits *.fit *.fts *.tif *.tiff"),
+                       ("FITS", "*.fits *.fit *.fts"),
+                       ("TIFF", "*.tif *.tiff"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.worker.open_path(path)
+        except Exception as e:
+            messagebox.showerror(
+                "Open failed",
+                f"{format_error(e)}\n\nStandalone mode needs the astropy, "
+                f"photutils and tifffile packages (pip install astropy "
+                f"photutils tifffile) in addition to numpy/Pillow.")
+            return
+        self._on_reload()
+
+    def _prompt_save_as(self, rgb_display):
+        """Runs on the main thread (queued from _process_thread, which
+        can't safely touch Tk itself) right after a standalone-mode Process
+        finishes - the equivalent of Siril mode's "applies directly to the
+        active image", since there's no live image here to apply to."""
+        base = os.path.splitext(self.active_filename.get())[0]
+        default_ext = self.worker._src_ext if self.worker._src_ext in (".fits", ".fit", ".tif", ".tiff") else ".fits"
+        path = filedialog.asksaveasfilename(
+            title="Save processed image",
+            initialfile=f"{base}_frankSpikes{default_ext}",
+            defaultextension=default_ext,
+            filetypes=[("FITS", "*.fits *.fit *.fts"), ("TIFF", "*.tif *.tiff")])
+        if not path:
+            self.status.set("Process complete - not saved.")
+            return
+        try:
+            self.worker.save_rgb(rgb_display, path)
+            self.status.set(f"Saved: {path}")
+        except Exception as e:
+            messagebox.showerror("Save failed", format_error(e))
+
+    def _on_save_as_menu(self):
+        """File > Save As... - re-saves the last Process() result without
+        recomputing, e.g. to export a second copy in another format."""
+        if self.worker.last_rgb is None:
+            messagebox.showinfo("Save", 'Click "Process" first to generate '
+                                         'a result to save.')
+            return
+        self._prompt_save_as(self.worker.last_rgb)
+
     # ---------- Reload from Siril (background thread) ----------
     def _on_reload(self):
         self.btn_process.config(state="disabled")
@@ -2027,9 +3165,12 @@ class App:
             self.worker.log(f"frankSpikes {APP_VERSION}")
 
             if not self.worker.is_image_loaded():
-                self.queue.put(("error", "No image is currently open in Siril.\n\n"
-                                          "Open the image you want to edit in Siril, "
-                                          "then run this script again."))
+                if self.worker.standalone:
+                    self.queue.put(("no_image", None))
+                else:
+                    self.queue.put(("error", "No image is currently open in Siril.\n\n"
+                                              "Open the image you want to edit in Siril, "
+                                              "then run this script again."))
                 return
 
             filename = self.worker.get_active_filename()
@@ -2064,7 +3205,8 @@ class App:
                 self.worker.log(f"frankSpikes: star detection failed, spikes disabled: {e}")
                 stars = []
 
-            self.queue.put(("status", "Reading the active image from Siril..."))
+            self.queue.put(("status", "Reading the image..." if self.worker.standalone
+                                       else "Reading the active image from Siril..."))
             full_rgb = self.worker.fetch_full()
             full_shape = full_rgb.shape[:2]
             preview_rgb = downsample(full_rgb)
@@ -2102,6 +3244,29 @@ class App:
                     f"Minimum diameter slider or the maxstars cap")
                 stars = stars + extra
 
+            # Scales the default spike Length (per-anchor and Simple/
+            # Uniform alike) to this image's own telescope focal length -
+            # see _focal_length_to_spike_length. None (no/invalid FOCALLEN
+            # keyword) leaves the hand-tuned defaults untouched, same
+            # "only ever calibrate once at load, never overwrite a user
+            # edit" rule as size_calibration below.
+            try:
+                focal_length = self.worker.get_focal_length()
+            except Exception as e:
+                self.worker.log(f"frankSpikes: couldn't read focal length: {e}")
+                focal_length = None
+            focal_calib = compute_focal_calibration(focal_length)
+            length_scale = focal_calib["length_scale"]
+            thickness_scale = focal_calib["thickness_scale"]
+            intensity_scale = focal_calib["intensity_scale"]
+            diam_scale = focal_calib["diam_scale"]
+            if focal_length:
+                self.worker.log(
+                    f"frankSpikes: focal length={focal_length:.0f}mm -> default spike "
+                    f"length scaled x{length_scale:.2f}, thickness x{thickness_scale:.2f}, "
+                    f"intensity x{intensity_scale:.2f}, minimum-diameter cutoff "
+                    f"x{diam_scale:.2f}")
+
             # What "Small"/"Medium"/"Large" should mean is inherently
             # image-dependent (a 6px star is huge for one setup, tiny for
             # another oversampled/binned one) - fixed pixel defaults tuned
@@ -2113,19 +3278,27 @@ class App:
             # Small anchor, p50 (median - literally what a typical star
             # here looks like) for Medium, p90 (clearly bigger/brighter
             # than most, but not chasing one freak saturated outlier) for
-            # Large. Only the anchors' "diam" (where each look applies)
-            # gets set this way - the 8 look parameters (intensity, length,
-            # etc.) stay at their hand-tuned defaults, or whatever the user
-            # has already dialled in.
+            # Large - then, if diam_scale is known (see above), scaled up a
+            # little further so the cutoff stays choosy about which stars
+            # are "big enough" for a spike even at a focal length whose
+            # whole real size range is compressed into fewer pixels. Only
+            # the anchors' "diam" (where each look applies) gets set this
+            # way - the other look parameters (soft flare, color, etc. -
+            # Length/Thickness/Intensity are the exceptions, see above)
+            # stay at their hand-tuned defaults, or whatever the user has
+            # already dialled in.
             size_calibration = None
             if stars:
                 fwhm_arr = np.array([s[2] for s in stars], dtype=np.float64)
                 p5, p50, p90 = np.percentile(fwhm_arr, [5, 50, 90])
-                size_calibration = {"small": float(p5), "medium": float(p50), "large": float(p90)}
+                ds = diam_scale or 1.0
+                size_calibration = {"small": float(p5) * ds, "medium": float(p50) * ds,
+                                     "large": float(p90) * ds}
                 self.worker.log(
                     f"frankSpikes: calibrated star sizes for this image - "
                     f"Small={p5:.1f}px (p5) Medium={p50:.1f}px (median) "
-                    f"Large={p90:.1f}px (p90)")
+                    f"Large={p90:.1f}px (p90)"
+                    + (f", scaled x{ds:.2f} for focal length" if diam_scale else ""))
 
             if stars:
                 # findstar's photometric centroid can be pulled slightly off
@@ -2168,27 +3341,23 @@ class App:
                 stars = [(x, fh - 1.0 - y, fw_, a, color) for (x, y, fw_, a, color) in stars]
 
             self.queue.put(("loaded", (filename, full_rgb, preview_rgb, full_shape, stars,
-                                        size_calibration)))
+                                        size_calibration, length_scale, thickness_scale,
+                                        intensity_scale)))
             self.queue.put(("status", "Ready. Adjust the sliders."))
         except Exception as e:
             self.queue.put(("error", format_error(e)))
 
     # ---------- Live preview (pure numpy, no Siril calls) ----------
     def _update_all_labels(self):
-        self.exposure_label.set(f"{self.exposure.get():.0f}")
-        self.contrast_label.set(f"{self.contrast.get():.0f}")
-        self.blacks_label.set(f"{self.blacks.get():.0f}")
-        self.highlights_label.set(f"{self.highlights.get():.0f}")
-        self.clarity_label.set(f"{self.clarity.get():.0f}")
-        self.vibrance_label.set(f"{self.vibrance.get():.0f}")
-        self.saturation_label.set(f"{self.saturation.get():.0f}")
-        self.temperature_label.set(f"{self.temperature.get():.1f}")
-        self.tint_label.set(f"{self.tint.get():.1f}")
+        for key, _label, _lo, _hi, _step, fmt in TONE_PARAM_DEFS:
+            self.tone[key + "_label"].set(fmt.format(self.tone[key].get()))
         self.spike_rotation_label.set(f"{self.spike_rotation.get():.0f}")
         self.spike_sharpness_label.set(f"{self.spike_sharpness.get():.0f}")
         self.spike_hue_label.set(f"{self.spike_hue.get():.0f}")
         self.spike_variation_label.set(f"{self.spike_variation.get():.0f}")
         self.spike_twinkle_label.set(f"{self.spike_twinkle.get():.0f}")
+        self.spike_rainbow_period_label.set(f"{self.spike_rainbow_period.get():.0f}")
+        self.spike_flare_symmetry_label.set(f"{self.spike_flare_symmetry.get():.0f}")
         self.spike_uniform_min_diam_label.set(f"{self.spike_uniform_min_diam.get():.0f}")
         for key, _label, _lo, _hi, _step, fmt in SPIKE_ANCHOR_PARAM_DEFS:
             for av in self.spike_anchors:
@@ -2198,18 +3367,30 @@ class App:
                 self.spike_star[key + "_label"].set(fmt.format(self.spike_star[key].get()))
 
     def _on_tone_slider(self):
-        """Light & Tones / Color & Hue sliders: cheap, so recompute and
-        redraw immediately. Spikes are independent of these params, so the
-        last computed spike layer is simply reused rather than recomputed -
-        this used to be the main cause of sluggish dragging, since every
-        single tick was re-rendering spikes from scratch regardless of
-        which slider actually moved."""
+        """Base/Detail (left panel) sliders: cheap, so recompute and
+        redraw immediately - see the note on apply_cosmetics gating every
+        stage on its own param being nonzero, which is what keeps this
+        cheap even as more stages are added. Spikes are independent of
+        these params, so the last computed spike layer is simply reused
+        rather than recomputed - this used to be the main cause of
+        sluggish dragging, since every single tick was re-rendering spikes
+        from scratch regardless of which slider actually moved.
+
+        While zoomed in (zoom_mode == "manual"), only the visible crop is
+        recomputed - the Fit raster covers the WHOLE image and isn't even
+        on screen right now (_redraw_canvas's manual branch draws from
+        _hires_rgb, not _preview_rgb), so redoing it on every drag tick
+        was pure wasted work, worse the larger the image. It catches up in
+        one shot as soon as the framing/zoom actually changes back to Fit
+        (see _zoom_fit) or the view pans/zooms again (both already
+        re-fetch a fresh crop/raster on their own)."""
         self._update_all_labels()
         if not self.loaded:
             return
-        self._render_preview()
         if self.zoom_mode == "manual":
             self._schedule_hires_fetch()
+        else:
+            self._render_preview()
 
     def _on_spike_slider(self):
         """Diffraction Spikes sliders: the spike layer itself is the
@@ -2239,9 +3420,9 @@ class App:
             self._schedule_hires_fetch()
 
     def _slider_values(self):
-        return (self.exposure.get(), self.temperature.get(), self.tint.get(),
-                self.contrast.get(), self.blacks.get(), self.highlights.get(),
-                self.clarity.get(), self.vibrance.get(), self.saturation.get())
+        """The single dict apply_cosmetics takes: Base/Detail params, each
+        under its own TONE_PARAM_DEFS key."""
+        return {key: self.tone[key].get() for key, *_r in TONE_PARAM_DEFS}
 
     def _spike_config(self):
         """The single config object render_spike_layer takes: the size-
@@ -2262,6 +3443,8 @@ class App:
             "sharpness": self.spike_sharpness.get(),
             "variation": self.spike_variation.get(),
             "twinkle": self.spike_twinkle.get(),
+            "flare_symmetry": self.spike_flare_symmetry.get(),
+            "rainbow_period": self.spike_rainbow_period.get(),
         }
 
     def _uniform_anchors(self):
@@ -2276,7 +3459,7 @@ class App:
         maintain."""
         min_d = self.spike_uniform_min_diam.get()
         full = {k: self.spike_uniform[k].get() for k in _ANCHOR_PARAM_KEYS}
-        zero = {k: 0.0 for k in _ANCHOR_PARAM_KEYS}
+        zero = {k: (full[k] if k in _SPIKE_GEOMETRY_KEYS else 0.0) for k in _ANCHOR_PARAM_KEYS}
         return [
             {"diam": min_d, **zero},
             {"diam": min_d * SPIKE_UNIFORM_REF_MULT, **full},
@@ -2320,6 +3503,55 @@ class App:
         if self.loaded:
             self._schedule_spike_preview()
 
+    def _reset_tone_defaults(self):
+        """Resets every left-panel control (Base, Detail) back to 0/no-
+        change - the Diffraction Spikes panel's own "Reset manual edits"/
+        "Defaults" buttons are unaffected, this is just the tone/color
+        side."""
+        for key, _label, _lo, _hi, _step, _fmt in TONE_PARAM_DEFS:
+            self.tone[key].set(TONE_DEFAULTS[key])
+        self._on_tone_slider()
+
+    def _on_magic_wand(self):
+        """One button, two conservative "make it look right" corrections
+        that don't require choosing per-color/per-channel values by hand
+        (see compute_auto_tone/compute_focal_calibration's own docstrings
+        for what each does and doesn't touch):
+          - Base's Temperature/Tint/Blacks/Whites, from an auto white
+            balance + auto levels pass over the actual pixels.
+          - Spike Length/Thickness/Intensity and the Minimum diameter
+            cutoff, from this image's own focal length - the same
+            calibration _reload_thread applies once automatically at load,
+            re-run on demand (e.g. after fiddling with sliders and wanting
+            a sane baseline back, without a full Reload)."""
+        if not self.loaded or self._src_preview_rgb is None:
+            return
+        auto = compute_auto_tone(self._src_preview_rgb)
+        for key, value in auto.items():
+            self.tone[key].set(value)
+
+        try:
+            focal_length = self.worker.get_focal_length()
+        except Exception as e:
+            self.worker.log(f"frankSpikes: couldn't read focal length: {e}")
+            focal_length = None
+        calib = compute_focal_calibration(focal_length)
+        if calib["length_scale"] is not None:
+            self._apply_length_calibration(calib["length_scale"])
+        if calib["thickness_scale"] is not None:
+            self._apply_thickness_calibration(calib["thickness_scale"])
+        if calib["intensity_scale"] is not None:
+            self._apply_intensity_calibration(calib["intensity_scale"])
+        if calib["diam_scale"] is not None and self._stars:
+            fwhm_arr = np.array([s[2] for s in self._stars], dtype=np.float64)
+            p5, p50, p90 = np.percentile(fwhm_arr, [5, 50, 90])
+            ds = calib["diam_scale"]
+            self._apply_size_calibration({"small": float(p5) * ds, "medium": float(p50) * ds,
+                                            "large": float(p90) * ds})
+
+        self._on_tone_slider()
+        self._schedule_spike_preview()
+
     def _reset_spike_defaults(self):
         """Resets the spike sliders to SPIKE_DEFAULTS - leaves per-star
         Ctrl+Click edits and Shift+Click overrides (disabled/forced/manual/
@@ -2332,6 +3564,8 @@ class App:
         self.spike_sharpness.set(d["sharpness"])
         self.spike_variation.set(d["variation"])
         self.spike_twinkle.set(d["twinkle"])
+        self.spike_flare_symmetry.set(d["flare_symmetry"])
+        self.spike_rainbow_period.set(d["rainbow_period"])
         for av, defaults in zip(self.spike_anchors, d["anchors"]):
             for key, *_ in SPIKE_ANCHOR_PARAM_DEFS:
                 av[key].set(defaults[key])
@@ -2370,6 +3604,33 @@ class App:
             lo, hi = spike_anchor_slider_range(tab_index, "diam")
             av["diam"].set(min(hi, max(lo, value)))
         self._update_all_labels()
+
+    def _apply_anchor_param_scale(self, key, scale):
+        """Scales one look parameter (by its SPIKE_ANCHOR_PARAM_DEFS key) -
+        per-anchor and Simple/Uniform alike - by `scale`, clamped to each
+        slider's own range. Shared by _apply_length_calibration/
+        _apply_thickness_calibration/_apply_intensity_calibration below
+        (see _reload_thread's focal-length-derived scale factors). Same
+        timing/guarantee as _apply_size_calibration: runs once right after
+        Reload, before the user has touched anything, and never touches
+        any OTHER look parameter."""
+        lo, hi = _SPIKE_ANCHOR_PARAM_FULL_RANGE[key]
+        uniform_val = SPIKE_UNIFORM_DEFAULTS[key] * scale
+        self.spike_uniform[key].set(min(hi, max(lo, uniform_val)))
+        for tab_index, (av, defaults) in enumerate(
+                zip(self.spike_anchors, SPIKE_DEFAULTS["anchors"])):
+            lo_t, hi_t = spike_anchor_slider_range(tab_index, key)
+            av[key].set(min(hi_t, max(lo_t, defaults[key] * scale)))
+        self._update_all_labels()
+
+    def _apply_length_calibration(self, length_scale):
+        self._apply_anchor_param_scale("length", length_scale)
+
+    def _apply_thickness_calibration(self, thickness_scale):
+        self._apply_anchor_param_scale("thickness", thickness_scale)
+
+    def _apply_intensity_calibration(self, intensity_scale):
+        self._apply_anchor_param_scale("intensity", intensity_scale)
 
     def _seed_per_size_from_uniform(self):
         """One-time hand-off when switching Uniform -> Per size: sets the
@@ -2423,16 +3684,19 @@ class App:
         if self._selected_star_key is not None:
             self._spike_notebook.grid_remove()
             self._spike_uniform_frame.grid_remove()
+            self._spike_min_diam_frame.grid_remove()
             self._spike_star_frame.grid()
             self._spike_help_label.config(text=self._spike_help_star)
         elif self.spike_mode.get() == "uniform":
             self._spike_notebook.grid_remove()
             self._spike_star_frame.grid_remove()
             self._spike_uniform_frame.grid()
+            self._spike_min_diam_frame.grid()
             self._spike_help_label.config(text=self._spike_help_uniform)
         else:
             self._spike_uniform_frame.grid_remove()
             self._spike_star_frame.grid_remove()
+            self._spike_min_diam_frame.grid_remove()
             self._spike_notebook.grid()
             self._spike_help_label.config(text=self._spike_help_per_size)
 
@@ -2544,7 +3808,7 @@ class App:
         whatever spike layer is already cached - the spike layer itself is
         recomputed separately (see _schedule_spike_preview), since it's the
         expensive part and doesn't depend on these sliders at all."""
-        self._base_preview_rgb = apply_cosmetics(self._src_preview_rgb, *self._slider_values())
+        self._base_preview_rgb = apply_cosmetics(self._src_preview_rgb, self._slider_values())
         self._compose_preview()
         self._redraw_canvas()
 
@@ -2666,7 +3930,14 @@ class App:
         self.zoom_mode = "fit"
         self._hires_rgb = None
         self._hires_wh = None
-        self._redraw_canvas()
+        if self.loaded:
+            # Refreshes the Fit raster (skipped on every tone-slider tick
+            # while zoomed in - see _on_tone_slider) with whatever the
+            # sliders currently say, in one shot, right as it becomes
+            # visible again.
+            self._render_preview()
+        else:
+            self._redraw_canvas()
 
     def _on_canvas_press(self, event):
         # Handled here (checking the modifier bits directly) rather than via
@@ -3001,7 +4272,7 @@ class App:
             rgb = full[req_y:req_y + req_h, req_x:req_x + req_w].copy()
             got_h, got_w = rgb.shape[:2]
 
-            rgb = apply_cosmetics(rgb, *vals)
+            rgb = apply_cosmetics(rgb, vals)
             if hide_bg:
                 rgb = np.zeros_like(rgb)
             spike_enabled, stars, sparams = spike_state
@@ -3195,7 +4466,7 @@ class App:
                     f"{cur_shape[1]}x{cur_shape[0]}). Run the script again.")
 
             self.queue.put(("status", "Process: applying adjustments..."))
-            rgb_final = apply_cosmetics(self._pristine_full, *vals)
+            rgb_final = apply_cosmetics(self._pristine_full, vals)
 
             if spike_enabled and stars:
                 self.queue.put(("status", "Process: rendering diffraction spikes..."))
@@ -3203,12 +4474,16 @@ class App:
                 layer = render_spike_layer((fh, fw), 0, 0, fw, fh, stars, sparams)
                 rgb_final = apply_spikes(rgb_final, layer)
 
-            self.queue.put(("status", "Process: applying to the active image in Siril..."))
-            self.worker.push_rgb(rgb_final)
-
-            self.queue.put(("status", "Done - applied to the active image in Siril. "
-                                       "Keep adjusting and Process again if you want."))
-            self.queue.put(("done", None))
+            if self.worker.standalone:
+                self.queue.put(("status", "Process: rendering finished..."))
+                self.worker.push_rgb(rgb_final)
+                self.queue.put(("processed_standalone", rgb_final))
+            else:
+                self.queue.put(("status", "Process: applying to the active image in Siril..."))
+                self.worker.push_rgb(rgb_final)
+                self.queue.put(("status", "Done - applied to the active image in Siril. "
+                                           "Keep adjusting and Process again if you want."))
+                self.queue.put(("done", None))
         except Exception as e:
             self.queue.put(("error", format_error(e)))
 
@@ -3221,7 +4496,8 @@ class App:
                     self.status.set(payload)
                 elif kind == "loaded":
                     (filename, self._pristine_full, self._src_preview_rgb,
-                     self.full_shape, self._stars, size_calibration) = payload
+                     self.full_shape, self._stars, size_calibration,
+                     length_scale, thickness_scale, intensity_scale) = payload
                     self.active_filename.set(filename)
                     self._spike_disabled = set()
                     self._spike_forced = set()
@@ -3236,6 +4512,12 @@ class App:
                     self.view_cx, self.view_cy = 0.5, 0.5
                     if size_calibration is not None:
                         self._apply_size_calibration(size_calibration)
+                    if length_scale is not None:
+                        self._apply_length_calibration(length_scale)
+                    if thickness_scale is not None:
+                        self._apply_thickness_calibration(thickness_scale)
+                    if intensity_scale is not None:
+                        self._apply_intensity_calibration(intensity_scale)
                     self._busy_end()
                     self.btn_process.config(state="normal")
                     self._render_preview()
@@ -3269,6 +4551,14 @@ class App:
                     # adjusting sliders and Process again as many times as
                     # they want - always re-applied from the untouched
                     # pristine source, never stacked on the previous result.
+                elif kind == "processed_standalone":
+                    self._busy_end()
+                    self._siril_busy = False
+                    self.btn_process.config(state="normal")
+                    self._prompt_save_as(payload)
+                elif kind == "no_image":
+                    self._busy_end()
+                    self.status.set("Open an image (File > Open...) to get started.")
                 elif kind == "error":
                     self._busy_end()
                     self._siril_busy = False
@@ -3299,16 +4589,29 @@ def _make_dpi_aware():
         pass
 
 
+def _make_worker():
+    """SirilWorker if sirilpy is installed AND a running Siril accepts the
+    connection, FileWorker (standalone mode) otherwise - both "sirilpy
+    isn't installed at all" (a standalone install - see the optional
+    import at the top of this file) and "Siril isn't running right now"
+    fall back the exact same way, via the same SirilConnectionError."""
+    try:
+        if s is None:
+            raise SirilConnectionError("sirilpy is not installed")
+        return SirilWorker()
+    except SirilConnectionError:
+        # FileWorker needs nothing beyond numpy to construct, so this
+        # can't fail the same way SirilWorker() just did.
+        return FileWorker()
+
+
 def main():
     _make_dpi_aware()
-    try:
-        worker = SirilWorker()
-    except SirilConnectionError as e:
-        print(f"Error connecting to Siril: {e}")
-        return
+    worker = _make_worker()
 
     root = tk.Tk()
-    root.title(f"frankSpikes {APP_VERSION} — by Frank Sferlazza")
+    title_suffix = " (standalone)" if worker.standalone else ""
+    root.title(f"frankSpikes {APP_VERSION}{title_suffix} — by Frank Sferlazza")
     root.minsize(700, 500)
     # Kept as an attribute, not a local var: Tk only keeps a PhotoImage
     # alive as long as something in Python still references it, and a

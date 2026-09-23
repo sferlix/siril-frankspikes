@@ -7,6 +7,8 @@ from _harness import fs
 
 
 class StubWorker:
+    standalone = False
+
     def get_wd(self):
         return "."
 

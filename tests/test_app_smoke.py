@@ -6,6 +6,8 @@ from _harness import fs
 
 
 class StubWorker:
+    standalone = False
+
     def get_wd(self):
         return "."
 
@@ -123,6 +125,218 @@ class TestPipeline(AppCase):
         a._start_spike_preview()
         self.assertIsNone(a._spike_layer_preview)
         self.assertIsNone(a._spike_layer_key)
+
+
+class TestFlareSymmetrySlider(AppCase):
+    """The global "Flare ray symmetry" slider replaces the old Ray flare
+    count: it must reach the render config and be restored by Defaults."""
+
+    def test_reaches_the_config_and_resets(self):
+        a = self.app
+        a.spike_flare_symmetry.set(90.0)
+        a._update_all_labels()
+        self.assertEqual(a._spike_config()["flare_symmetry"], 90.0)
+        self.assertEqual(a.spike_flare_symmetry_label.get(), "90")
+        a._reset_spike_defaults()
+        self.assertEqual(a.spike_flare_symmetry.get(), fs.SPIKE_DEFAULTS["flare_symmetry"])
+
+
+class TestSimpleModeKeepsFlareGeometry(AppCase):
+    """In Simple mode every strength ramps from 0 at the Minimum diameter,
+    but the flare reach/ring diameter must not - a reach ramping from 0
+    collapsed mid-size stars' flares into their own core."""
+
+    def test_geometry_keys_do_not_ramp(self):
+        a = self.app
+        a.spike_uniform["flare_reach"].set(70.0)
+        a.spike_uniform["ring_diam"].set(2.5)
+        lo, hi = sorted(a._uniform_anchors(), key=lambda x: x["diam"])
+        self.assertEqual(lo["flare_reach"], 70.0)
+        self.assertEqual(lo["ring_diam"], 2.5)
+        self.assertEqual(lo["soft_flare"], 0.0)
+
+    def test_small_tab_gets_the_full_geometry_range(self):
+        self.assertEqual(fs.spike_anchor_slider_range(0, "flare_reach"),
+                         fs._SPIKE_ANCHOR_PARAM_FULL_RANGE["flare_reach"])
+
+
+class TestToneResetButton(AppCase):
+    """The left panel's own "Reset" button (separate from the Diffraction
+    Spikes panel's "Reset manual edits"/"Defaults") must zero out Base/
+    Detail alike."""
+
+    def test_reset_zeroes_base_and_detail(self):
+        a = self.app
+        a.tone["exposure"].set(40.0)
+        a.tone["saturation"].set(-25.0)
+        a._reset_tone_defaults()
+        self.assertEqual(a.tone["exposure"].get(), 0.0)
+        self.assertEqual(a.tone["saturation"].get(), 0.0)
+
+    def test_reset_does_not_touch_spike_settings(self):
+        a = self.app
+        a.spike_rotation.set(45.0)
+        a.tone["exposure"].set(40.0)
+        a._reset_tone_defaults()
+        self.assertEqual(a.spike_rotation.get(), 45.0)
+
+
+class TestLengthCalibration(AppCase):
+    """_apply_length_calibration scales the default Spike Length (Simple/
+    Uniform and every per-size anchor) by the focal-length-derived factor
+    computed in _reload_thread - see _focal_length_to_spike_length."""
+
+    def test_scales_uniform_and_all_three_anchors(self):
+        a = self.app
+        a._apply_length_calibration(2.0)
+        self.assertAlmostEqual(a.spike_uniform["length"].get(),
+                                fs.SPIKE_UNIFORM_DEFAULTS["length"] * 2.0, places=3)
+        for av, defaults in zip(a.spike_anchors, fs.SPIKE_DEFAULTS["anchors"]):
+            lo, hi = fs.spike_anchor_slider_range(
+                a.spike_anchors.index(av), "length")
+            expected = min(hi, max(lo, defaults["length"] * 2.0))
+            self.assertAlmostEqual(av["length"].get(), expected, places=3)
+
+    def test_only_touches_length_not_other_look_params(self):
+        a = self.app
+        before = a.spike_anchors[2]["intensity"].get()
+        a._apply_length_calibration(1.5)
+        self.assertEqual(a.spike_anchors[2]["intensity"].get(), before)
+
+    def test_result_is_clamped_to_the_slider_range(self):
+        a = self.app
+        a._apply_length_calibration(100.0)  # absurdly large - must clamp, not error
+        lo, hi = fs._SPIKE_ANCHOR_PARAM_FULL_RANGE["length"]
+        self.assertLessEqual(a.spike_uniform["length"].get(), hi)
+
+
+class TestThicknessAndIntensityCalibration(AppCase):
+    """Same _apply_anchor_param_scale machinery as Length (see
+    TestLengthCalibration), applied to Thickness and Intensity - the two
+    other focal-length-derived defaults from _reload_thread."""
+
+    def test_thickness_scales_uniform_and_anchors(self):
+        a = self.app
+        a._apply_thickness_calibration(0.85)
+        self.assertAlmostEqual(a.spike_uniform["thickness"].get(),
+                                fs.SPIKE_UNIFORM_DEFAULTS["thickness"] * 0.85, places=3)
+        for i, (av, defaults) in enumerate(zip(a.spike_anchors, fs.SPIKE_DEFAULTS["anchors"])):
+            lo, hi = fs.spike_anchor_slider_range(i, "thickness")
+            expected = min(hi, max(lo, defaults["thickness"] * 0.85))
+            self.assertAlmostEqual(av["thickness"].get(), expected, places=3)
+
+    def test_intensity_scales_uniform_and_anchors(self):
+        a = self.app
+        a._apply_intensity_calibration(1.15)
+        self.assertAlmostEqual(a.spike_uniform["intensity"].get(),
+                                fs.SPIKE_UNIFORM_DEFAULTS["intensity"] * 1.15, places=3)
+        for i, (av, defaults) in enumerate(zip(a.spike_anchors, fs.SPIKE_DEFAULTS["anchors"])):
+            lo, hi = fs.spike_anchor_slider_range(i, "intensity")
+            expected = min(hi, max(lo, defaults["intensity"] * 1.15))
+            self.assertAlmostEqual(av["intensity"].get(), expected, places=3)
+
+    def test_thickness_calibration_does_not_touch_intensity_or_length(self):
+        a = self.app
+        before_intensity = a.spike_anchors[1]["intensity"].get()
+        before_length = a.spike_anchors[1]["length"].get()
+        a._apply_thickness_calibration(0.7)
+        self.assertEqual(a.spike_anchors[1]["intensity"].get(), before_intensity)
+        self.assertEqual(a.spike_anchors[1]["length"].get(), before_length)
+
+
+class TestTonePreviewZoomGating(AppCase):
+    """A tone slider drag while zoomed in (zoom_mode == "manual") must only
+    refresh the visible hi-res crop, not the whole (Fit) raster - see the
+    note on _on_tone_slider. Returning to Fit (_zoom_fit) then refreshes
+    the whole raster in one shot."""
+
+    def test_manual_zoom_skips_full_preview_render(self):
+        a = self.app
+        a.loaded = True
+        a.zoom_mode = "manual"
+        calls = {"render": 0, "hires": 0}
+        a._render_preview = lambda: calls.__setitem__("render", calls["render"] + 1)
+        a._schedule_hires_fetch = lambda: calls.__setitem__("hires", calls["hires"] + 1)
+        a._on_tone_slider()
+        self.assertEqual(calls["render"], 0)
+        self.assertEqual(calls["hires"], 1)
+
+    def test_fit_zoom_renders_the_full_preview(self):
+        a = self.app
+        a.loaded = True
+        a.zoom_mode = "fit"
+        calls = {"render": 0, "hires": 0}
+        a._render_preview = lambda: calls.__setitem__("render", calls["render"] + 1)
+        a._schedule_hires_fetch = lambda: calls.__setitem__("hires", calls["hires"] + 1)
+        a._on_tone_slider()
+        self.assertEqual(calls["render"], 1)
+        self.assertEqual(calls["hires"], 0)
+
+    def test_zoom_fit_refreshes_the_full_preview_when_loaded(self):
+        a = self.app
+        a.loaded = True
+        a.zoom_mode = "manual"
+        calls = {"render": 0}
+        a._render_preview = lambda: calls.__setitem__("render", calls["render"] + 1)
+        a._zoom_fit()
+        self.assertEqual(a.zoom_mode, "fit")
+        self.assertEqual(calls["render"], 1)
+
+    def test_zoom_fit_does_not_crash_before_load(self):
+        a = self.app
+        a.loaded = False
+        a._zoom_fit()  # must not raise even with no image loaded yet
+        self.assertEqual(a.zoom_mode, "fit")
+
+
+class TestMagicWand(AppCase):
+    """The Magic Wand button: auto white balance/levels (Base) plus
+    focal-length spike calibration, in one click - see App._on_magic_wand,
+    compute_auto_tone and compute_focal_calibration."""
+
+    def _prime_loaded_state(self, focal_length=500.0):
+        a = self.app
+        a.loaded = True
+        rng = np.random.default_rng(0)
+        img = np.clip(0.05 + rng.normal(0, 0.01, (60, 60, 3)), 0, 1).astype(np.float32)
+        img[::5, ::5] = 0.9  # sprinkle in enough "stars" to be a believable field
+        a._src_preview_rgb = img
+        a._stars = [(float(x), float(y), 6.0 + (x % 5), 1.0, (1.0, 1.0, 1.0))
+                    for x in range(0, 60, 5) for y in range(0, 60, 5)]
+        a.worker.get_focal_length = lambda: focal_length
+        a._render_preview = lambda: None
+        a._schedule_spike_preview = lambda: None
+        return a
+
+    def test_does_nothing_before_an_image_is_loaded(self):
+        a = self.app
+        a.loaded = False
+        before = a.tone["temperature"].get()
+        a._on_magic_wand()
+        self.assertEqual(a.tone["temperature"].get(), before)
+
+    def test_sets_base_tone_from_the_image(self):
+        a = self._prime_loaded_state()
+        a.tone["temperature"].set(0.0)
+        a.tone["blacks"].set(0.0)
+        a._on_magic_wand()
+        expected = fs.compute_auto_tone(a._src_preview_rgb)
+        for key, value in expected.items():
+            self.assertAlmostEqual(a.tone[key].get(), value, places=3)
+
+    def test_applies_focal_length_spike_calibration(self):
+        a = self._prime_loaded_state(focal_length=300.0)
+        a._on_magic_wand()
+        calib = fs.compute_focal_calibration(300.0)
+        self.assertAlmostEqual(a.spike_uniform["length"].get(),
+                                fs.SPIKE_UNIFORM_DEFAULTS["length"] * calib["length_scale"],
+                                places=3)
+
+    def test_no_focal_length_leaves_spike_defaults_alone(self):
+        a = self._prime_loaded_state(focal_length=None)
+        before = a.spike_uniform["length"].get()
+        a._on_magic_wand()
+        self.assertEqual(a.spike_uniform["length"].get(), before)
 
 
 if __name__ == "__main__":

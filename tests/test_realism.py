@@ -74,10 +74,17 @@ class TestTwinkleFloor(unittest.TestCase):
 
 
 class TestRainbowDefaults(unittest.TestCase):
-    def test_default_rainbow_is_off(self):
-        for a in fs.SPIKE_DEFAULTS["anchors"]:
-            self.assertEqual(a["rainbow"], 0.0)
-        self.assertEqual(fs.SPIKE_UNIFORM_DEFAULTS["rainbow"], 0.0)
+    def test_small_stars_have_no_rainbow_and_it_grows_with_size(self):
+        """The rainbow is now the physical diffraction pattern (see
+        _diffraction_mult), not an artificial hue cycle - on by default,
+        but only where a star is big enough to show it."""
+        anchors = fs.SPIKE_DEFAULTS["anchors"]
+        self.assertEqual(anchors[0]["rainbow"], 0.0)
+        self.assertLessEqual(anchors[1]["rainbow"], anchors[2]["rainbow"])
+        self.assertGreater(anchors[2]["rainbow"], 0.0)
+
+    def test_chroma_parameter_is_gone(self):
+        self.assertNotIn("chroma", fs._ANCHOR_PARAM_KEYS)
 
 
 class TestRingBlend(unittest.TestCase):
